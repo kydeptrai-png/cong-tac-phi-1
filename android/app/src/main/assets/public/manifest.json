@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "Sổ Chi Tiêu & Quản Lý Công Tác Phí",
+  "short_name": "Sổ Chi Tiêu",
+  "description": "Ứng dụng quản lý công tác phí và chi tiêu cá nhân, chụp hóa đơn thông minh, nhập/xuất Excel, hoạt động offline.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f766e",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

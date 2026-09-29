@@ -1,0 +1,8 @@
+{
+  "name": " Sổ Chi Tiêu \u0026 Quản Lý Công Tác Phí 29.9",
+  "description": "Ứng dụng quản lý công tác phí và chi tiêu cá nhân, nhập/xuất Excel thông minh, nhận diện hóa đơn tự động với AI, lưu trữ ngoại tuyến an toàn.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

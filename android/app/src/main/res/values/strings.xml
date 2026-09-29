@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Sổ Chi Tiêu</string>
+    <string name="title_activity_main">Sổ Chi Tiêu</string>
+    <string name="package_name">com.sochitieu.congtacphi</string>
+    <string name="custom_url_scheme">com.sochitieu.congtacphi</string>
+</resources>
