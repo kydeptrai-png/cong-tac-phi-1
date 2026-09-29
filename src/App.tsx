@@ -81,6 +81,9 @@ import {
   saveDriveSyncTimestamp,
   getAutoDriveSyncEnabled,
   setAutoDriveSyncEnabled,
+  saveAppUIContextSnapshot,
+  loadAppUIContextSnapshot,
+  clearAppUIContextSnapshot,
 } from './utils/googleDrive';
 
 const AUTO_BACKUP_STORAGE_KEY = 'so_chi_tieu_auto_backup_enabled';
@@ -163,9 +166,11 @@ export default function App() {
   const [lastDriveSyncTime, setLastDriveSyncTimeState] = useState<string | null>(() =>
     getLastDriveSyncTime()
   );
-  const [driveError, setDriveError] = useState<{ message: string; code: DriveErrorCode } | null>(
-    null
-  );
+  const [driveError, setDriveError] = useState<{
+    message: string;
+    code: DriveErrorCode;
+    firebaseErrorCode?: string;
+  } | null>(null);
   const [driveSyncModalState, setDriveSyncModalState] = useState<{
     isOpen: boolean;
     mode: 'newer_on_drive' | 'manual_sync';
@@ -238,7 +243,11 @@ export default function App() {
             : new DriveSyncError(err?.message || 'Lỗi đồng bộ Google Drive', 'UNKNOWN');
 
         setDriveSyncStatus('error');
-        setDriveError({ message: syncErr.message, code: syncErr.code });
+        setDriveError({
+          message: syncErr.message,
+          code: syncErr.code,
+          firebaseErrorCode: syncErr.firebaseErrorCode,
+        });
 
         if (syncErr.code === 'TOKEN_EXPIRED') {
           setHasActiveToken(false);
@@ -391,40 +400,9 @@ export default function App() {
     );
   };
 
-  // Initialize Firebase Auth state listener on mount
-  useEffect(() => {
-    const unsubscribe = initAuth(
-      (user) => {
-        setDriveUser(user);
-        setHasActiveToken(true);
-        setNeedsReauth(false);
-      },
-      (userWithoutToken) => {
-        if (userWithoutToken) {
-          setDriveUser(userWithoutToken);
-          setHasActiveToken(false);
-          setNeedsReauth(true);
-        } else {
-          setDriveUser(null);
-          setHasActiveToken(false);
-        }
-      }
-    );
-    return () => unsubscribe();
-  }, []);
-
-  // Requirement 1 & 3: Sign in with Google & check Drive backup timestamp
-  const handleGoogleLogin = async () => {
-    setDriveError(null);
-    try {
-      const result = await googleSignIn();
-      if (!result) return;
-
-      setDriveUser(result.user);
-      setHasActiveToken(true);
-      setNeedsReauth(false);
-
-      // When signed into Google Drive, automatically turn off local auto-download by default on first sign-in if not explicitly changed, or let user control it
+  // Helper to run post-login Drive check or upload (shared by Popup, GIS, and Redirect return)
+  const handlePostAuthDriveSync = useCallback(
+    async (accessToken: string, isRetryAfterReauth = false) => {
       try {
         const savedLocalPref = localStorage.getItem(AUTO_BACKUP_STORAGE_KEY);
         if (savedLocalPref === null) {
@@ -435,57 +413,208 @@ export default function App() {
         // ignore
       }
 
-      // If we were retrying after a token expiration during local edits, push local changes immediately
-      if (pendingRetryAfterReauthRef.current) {
+      if (isRetryAfterReauth || pendingRetryAfterReauthRef.current) {
         await performDriveUpload(
           latestDataRef.current.expenses,
           latestDataRef.current.advances,
           latestDataRef.current.profiles,
           false,
-          result.accessToken
+          accessToken
         );
         return;
       }
 
-      // Check existing backup on Google Drive
-      setDriveSyncStatus('syncing');
-      const remoteMeta = await findDriveBackupFile(result.accessToken);
-      setDriveSyncStatus('idle');
+      try {
+        setDriveSyncStatus('syncing');
+        const remoteMeta = await findDriveBackupFile(accessToken);
+        setDriveSyncStatus('idle');
 
-      if (remoteMeta) {
-        const isNewer = isDriveBackupNewerThanLocal(
-          remoteMeta.modifiedTime,
-          getLastDriveSyncIso(),
-          getLocalLastModifiedIso()
-        );
+        if (remoteMeta) {
+          const isNewer = isDriveBackupNewerThanLocal(
+            remoteMeta.modifiedTime,
+            getLastDriveSyncIso(),
+            getLocalLastModifiedIso()
+          );
 
-        if (isNewer) {
-          // Prompt user: "Có bản mới hơn trên Drive, muốn tải về không?"
-          setDriveSyncModalState({
-            isOpen: true,
-            mode: 'newer_on_drive',
-            driveMeta: remoteMeta,
-          });
+          if (isNewer) {
+            setDriveSyncModalState({
+              isOpen: true,
+              mode: 'newer_on_drive',
+              driveMeta: remoteMeta,
+            });
+          } else {
+            showToast('Đã kết nối Google Drive! Dữ liệu trên máy đang là bản mới nhất.');
+          }
         } else {
-          showToast('Đã đăng nhập Google Drive! Dữ liệu trên máy đang là bản mới nhất.');
+          await performDriveUpload(
+            latestDataRef.current.expenses,
+            latestDataRef.current.advances,
+            latestDataRef.current.profiles,
+            false,
+            accessToken
+          );
         }
-      } else {
-        // No backup file on Drive yet -> perform initial upload to create CongTacPhi_backup.json
-        await performDriveUpload(
-          latestDataRef.current.expenses,
-          latestDataRef.current.advances,
-          latestDataRef.current.profiles,
-          false,
-          result.accessToken
-        );
+      } catch (err: any) {
+        setDriveSyncStatus('error');
+        const syncErr: DriveSyncError =
+          err instanceof DriveSyncError
+            ? err
+            : new DriveSyncError(err?.message || 'Lỗi kiểm tra file Google Drive', 'UNKNOWN');
+        setDriveError({
+          message: syncErr.message,
+          code: syncErr.code,
+          firebaseErrorCode: syncErr.firebaseErrorCode,
+        });
       }
+    },
+    [performDriveUpload]
+  );
+
+  // Requirement 5: Restore UI context snapshot on mount if returning from signInWithRedirect
+  useEffect(() => {
+    const snapshot = loadAppUIContextSnapshot();
+    if (!snapshot) return;
+
+    setCurrentTab(snapshot.currentTab || 'expenses');
+    if (snapshot.viewMode) setViewMode(snapshot.viewMode);
+    if (snapshot.activeProfileId) setActiveProfileId(snapshot.activeProfileId);
+    if (snapshot.selectedMonth) setSelectedMonth(snapshot.selectedMonth);
+    if (typeof snapshot.searchTerm === 'string') setSearchTerm(snapshot.searchTerm);
+    if (typeof snapshot.startDate === 'string') setStartDate(snapshot.startDate);
+    if (typeof snapshot.endDate === 'string') setEndDate(snapshot.endDate);
+    if (snapshot.minAmount !== undefined) setMinAmount(snapshot.minAmount);
+    if (snapshot.maxAmount !== undefined) setMaxAmount(snapshot.maxAmount);
+    if (snapshot.receiptFilter) setReceiptFilter(snapshot.receiptFilter);
+    if (typeof snapshot.onlyMissingReceipts === 'boolean') {
+      setOnlyMissingReceipts(snapshot.onlyMissingReceipts);
+    }
+    if (snapshot.defaultMonthForNew) setDefaultMonthForNew(snapshot.defaultMonthForNew);
+    if (snapshot.editingExpense) setEditingExpense(snapshot.editingExpense);
+
+    if (snapshot.openModal === 'expense') setIsExpenseModalOpen(true);
+    else if (snapshot.openModal === 'bulk') setIsBulkModalOpen(true);
+    else if (snapshot.openModal === 'settings') setIsSettingsModalOpen(true);
+    else if (snapshot.openModal === 'export') setIsExportModalOpen(true);
+    else if (snapshot.openModal === 'import') setIsImportModalOpen(true);
+    else if (snapshot.openModal === 'pdf') setIsPDFExportModalOpen(true);
+
+    if (snapshot.pendingDriveSyncAfterAuth) {
+      pendingRetryAfterReauthRef.current = true;
+    }
+
+    clearAppUIContextSnapshot();
+  }, []);
+
+  // Initialize Firebase Auth state listener & getRedirectResult on mount (Requirements 1, 2, 3, 5)
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token, isFromRedirect) => {
+        setDriveUser(user);
+        setHasActiveToken(true);
+        setNeedsReauth(false);
+        setDriveError(null);
+
+        if (isFromRedirect && token) {
+          showToast(`Đã đăng nhập Google (${user.email || user.displayName || 'Drive'}) thành công!`);
+          handlePostAuthDriveSync(token, pendingRetryAfterReauthRef.current);
+        }
+      },
+      (userWithoutToken) => {
+        if (userWithoutToken) {
+          setDriveUser(userWithoutToken);
+          setHasActiveToken(false);
+          setNeedsReauth(true);
+        } else {
+          setDriveUser(null);
+          setHasActiveToken(false);
+        }
+      },
+      (redirectErr) => {
+        setDriveSyncStatus('error');
+        setDriveError({
+          message: redirectErr.message,
+          code: redirectErr.code,
+          firebaseErrorCode: redirectErr.firebaseErrorCode,
+        });
+      }
+    );
+    return () => unsubscribe();
+  }, [handlePostAuthDriveSync]);
+
+  // Save current UI context right before Redirect Auth navigates away (Requirement 5)
+  const saveCurrentContextBeforeRedirect = useCallback(() => {
+    let openModal: 'none' | 'expense' | 'bulk' | 'settings' | 'export' | 'import' | 'pdf' = 'none';
+    if (isExpenseModalOpen) openModal = 'expense';
+    else if (isBulkModalOpen) openModal = 'bulk';
+    else if (isSettingsModalOpen) openModal = 'settings';
+    else if (isExportModalOpen) openModal = 'export';
+    else if (isImportModalOpen) openModal = 'import';
+    else if (isPDFExportModalOpen) openModal = 'pdf';
+
+    saveAppUIContextSnapshot({
+      currentTab,
+      viewMode,
+      activeProfileId,
+      selectedMonth,
+      searchTerm,
+      startDate,
+      endDate,
+      minAmount,
+      maxAmount,
+      receiptFilter,
+      onlyMissingReceipts,
+      openModal,
+      editingExpense,
+      defaultMonthForNew,
+      pendingDriveSyncAfterAuth: pendingRetryAfterReauthRef.current,
+      savedAt: Date.now(),
+    });
+  }, [
+    isExpenseModalOpen,
+    isBulkModalOpen,
+    isSettingsModalOpen,
+    isExportModalOpen,
+    isImportModalOpen,
+    isPDFExportModalOpen,
+    currentTab,
+    viewMode,
+    activeProfileId,
+    selectedMonth,
+    searchTerm,
+    startDate,
+    endDate,
+    minAmount,
+    maxAmount,
+    receiptFilter,
+    onlyMissingReceipts,
+    editingExpense,
+    defaultMonthForNew,
+  ]);
+
+  // Requirement 1 & 3: Sign in with Google & check Drive backup timestamp
+  const handleGoogleLogin = async () => {
+    setDriveError(null);
+    try {
+      const result = await googleSignIn(saveCurrentContextBeforeRedirect);
+      // If signInWithRedirect was triggered, result is null because browser is navigating
+      if (!result) return;
+
+      setDriveUser(result.user);
+      setHasActiveToken(true);
+      setNeedsReauth(false);
+
+      await handlePostAuthDriveSync(result.accessToken, pendingRetryAfterReauthRef.current);
     } catch (err: any) {
       setDriveSyncStatus('error');
       const syncErr: DriveSyncError =
         err instanceof DriveSyncError
           ? err
           : new DriveSyncError(err?.message || 'Đăng nhập Google thất bại', 'UNKNOWN');
-      setDriveError({ message: syncErr.message, code: syncErr.code });
+      setDriveError({
+        message: syncErr.message,
+        code: syncErr.code,
+        firebaseErrorCode: syncErr.firebaseErrorCode,
+      });
     }
   };
 
@@ -1369,7 +1498,6 @@ export default function App() {
         onOpenImportModal={() => setIsImportModalOpen(true)}
         onOpenExportModal={() => setIsExportModalOpen(true)}
         onOpenBulkModal={() => setIsBulkModalOpen(true)}
-        onOpenPDFExport={() => setIsPDFExportModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
         searchTerm={searchTerm}
         setSearchTerm={setSearchTerm}
@@ -1638,6 +1766,7 @@ export default function App() {
         onDownloadBackupNow={() =>
           performBackupDownload(expenses, advances, profiles, false)
         }
+        onOpenPDFExportModal={() => setIsPDFExportModalOpen(true)}
       />
 
       <PDFExportModal
@@ -1658,6 +1787,8 @@ export default function App() {
         onManualBackup={() =>
           performBackupDownload(expenses, advances, profiles, false)
         }
+        onExportPDF={handleExportPDF}
+        onOpenPDFExportModal={() => setIsPDFExportModalOpen(true)}
         driveUser={driveUser}
         hasActiveToken={hasActiveToken}
         needsReauth={needsReauth}

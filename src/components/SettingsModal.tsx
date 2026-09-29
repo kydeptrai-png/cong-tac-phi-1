@@ -20,6 +20,9 @@ import {
   Cloud,
   LogOut,
   CloudUpload,
+  Printer,
+  Globe,
+  Terminal,
 } from 'lucide-react';
 import { getUserApiKey, setUserApiKey, testGeminiApiKey } from '../utils/gemini';
 import { requestPersistentStorage } from '../utils/db';
@@ -32,6 +35,17 @@ import {
   setUserGoogleClientId,
   getDefaultGoogleClientId,
   getSavedDriveFileId,
+  detectStandaloneEnvironment,
+  StandaloneEnvironmentInfo,
+  AuthFlowPreference,
+  getPreferredAuthFlowMode,
+  setPreferredAuthFlowMode,
+  getEffectiveAuthDomain,
+  getUserCustomAuthDomain,
+  setUserCustomAuthDomain,
+  DEFAULT_FIREBASE_AUTH_DOMAIN,
+  getLastAuthDiagnosticLog,
+  AuthDiagnosticLog,
 } from '../utils/googleDrive';
 import { GoogleSignInButton } from './DriveSyncModal';
 
@@ -41,6 +55,9 @@ interface SettingsModalProps {
   autoBackupEnabled: boolean;
   onToggleAutoBackup: (enabled: boolean) => void;
   onManualBackup: () => void;
+  // PDF Export in Settings Menu (Requirement 2 of Toolbar)
+  onExportPDF?: () => void;
+  onOpenPDFExportModal?: () => void;
   // Google Drive Props
   driveUser: GoogleDriveUser | null;
   hasActiveToken: boolean;
@@ -49,7 +66,7 @@ interface SettingsModalProps {
   onToggleAutoDriveSync: (enabled: boolean) => void;
   driveSyncStatus: 'idle' | 'syncing' | 'synced' | 'error';
   lastDriveSyncTime: string | null;
-  driveError: { message: string; code: DriveErrorCode } | null;
+  driveError: { message: string; code: DriveErrorCode; firebaseErrorCode?: string } | null;
   onGoogleLogin: () => void;
   onGoogleLogout: () => void;
   onOpenDriveSyncModal: () => void;
@@ -62,6 +79,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   autoBackupEnabled,
   onToggleAutoBackup,
   onManualBackup,
+  onExportPDF,
+  onOpenPDFExportModal,
   driveUser,
   hasActiveToken,
   needsReauth,
@@ -84,12 +103,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     message: string;
   }>({ type: 'idle', message: '' });
 
-  // Google Client ID state (Requirement 1)
+  // Google Client ID state
   const [googleClientId, setGoogleClientId] = useState('');
   const [clientIdStatus, setClientIdStatus] = useState<{
     type: 'success' | 'idle';
     message: string;
   }>({ type: 'idle', message: '' });
+
+  // Firebase Auth Flow & AuthDomain state (Requirements 1, 2, 3, 4)
+  const [authFlowPref, setAuthFlowPref] = useState<AuthFlowPreference>('auto');
+  const [customAuthDomain, setCustomAuthDomain] = useState('');
+  const [authDomainSavedMsg, setAuthDomainSavedMsg] = useState<string | null>(null);
+  const [standaloneEnv, setStandaloneEnv] = useState<StandaloneEnvironmentInfo>(() =>
+    detectStandaloneEnvironment()
+  );
+  const [diagLog, setDiagLog] = useState<AuthDiagnosticLog | null>(() =>
+    getLastAuthDiagnosticLog()
+  );
+  const [showDiagDetails, setShowDiagDetails] = useState(false);
 
   // Storage Persistence state
   const [isPersisted, setIsPersisted] = useState<boolean | null>(null);
@@ -118,10 +149,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setGoogleClientId(currentClientId);
       setClientIdStatus({ type: 'idle', message: '' });
 
+      setAuthFlowPref(getPreferredAuthFlowMode());
+      setCustomAuthDomain(getUserCustomAuthDomain());
+      setAuthDomainSavedMsg(null);
+      setStandaloneEnv(detectStandaloneEnvironment());
+      setDiagLog(getLastAuthDiagnosticLog());
+
       checkPersistenceStatus();
       setIsNativeWrapper(isNativeAppOrWebView());
     }
-  }, [isOpen]);
+  }, [isOpen, driveError]);
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true);
@@ -159,7 +196,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       type: 'success',
       message: trimmed
         ? 'Đã lưu Google Client ID cá nhân vào bộ nhớ máy này. Khi bấm "Đăng nhập Google", ứng dụng sẽ dùng Google Identity Services với Client ID này.'
-        : 'Đã xóa Client ID cá nhân (sẽ dùng cấu hình Google OAuth mặc định của ứng dụng).',
+        : 'Đã xóa Client ID cá nhân (sẽ dùng cấu hình Firebase / Google OAuth mặc định của ứng dụng).',
     });
   };
 
@@ -170,6 +207,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       type: 'success',
       message: 'Đã xóa Google Client ID cá nhân khỏi thiết bị.',
     });
+  };
+
+  const handleChangeAuthFlowPref = (nextMode: AuthFlowPreference) => {
+    setAuthFlowPref(nextMode);
+    setPreferredAuthFlowMode(nextMode);
+  };
+
+  const handleSaveCustomAuthDomain = () => {
+    setUserCustomAuthDomain(customAuthDomain);
+    const effective = getEffectiveAuthDomain();
+    setAuthDomainSavedMsg(
+      `Đã lưu cấu hình authDomain: "${effective}". Tải lại ứng dụng nếu bạn vừa thay đổi tên miền xác thực.`
+    );
   };
 
   const handleSaveApiKey = () => {
@@ -286,6 +336,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const isDriveConnected = Boolean(driveUser && hasActiveToken);
   const savedFileId = getSavedDriveFileId();
   const hasBuiltInClientId = Boolean(getDefaultGoogleClientId());
+  const effectiveAuthDomain = getEffectiveAuthDomain();
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-200">
@@ -301,10 +352,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-bold text-slate-900 leading-tight">
-                Cài Đặt, Đồng Bộ Google Drive &amp; APK
+                Cài Đặt, Xuất PDF &amp; Đồng Bộ Google Drive
               </h3>
               <p className="text-xs text-slate-500">
-                Google Client ID, khóa Gemini API, đồng bộ Drive &amp; lưu trữ bền vững
+                Đồng bộ Drive (TWA/APK Redirect), xuất PDF, khóa Gemini API &amp; lưu trữ
               </p>
             </div>
           </div>
@@ -320,7 +371,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Scrollable Body */}
         <div className="px-5 py-4 overflow-y-auto space-y-5 text-slate-800">
-          {/* SECTION 0: GOOGLE DRIVE SYNC & CLIENT ID (Requirement 1, 2, 3, 4) */}
+          {/* SECTION: QUICK PDF EXPORT IN SETTINGS MENU (Toolbar Requirement 2) */}
+          {(onOpenPDFExportModal || onExportPDF) && (
+            <div className="rounded-2xl border border-teal-200 p-4 bg-teal-50/40 shadow-2xs space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Printer size={18} className="text-teal-700" />
+                  <h4 className="text-sm font-bold text-slate-900">
+                    Xuất Báo Cáo PDF Đính Kèm Ảnh Chứng Từ
+                  </h4>
+                </div>
+                <span className="text-[11px] font-semibold text-teal-800 bg-teal-100/80 px-2.5 py-0.5 rounded-full border border-teal-200">
+                  A4 / Kèm ảnh
+                </span>
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Tạo file báo cáo công tác phí định dạng PDF chuẩn tiếng Việt, tự động dàn trang bảng tổng hợp chi tiêu theo tháng và phụ lục ảnh hóa đơn chứng từ.
+              </p>
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                {onOpenPDFExportModal && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onOpenPDFExportModal();
+                    }}
+                    className="min-h-[42px] px-4 py-2 rounded-xl bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                  >
+                    <Printer size={15} />
+                    <span>Tùy chỉnh &amp; Xuất file PDF</span>
+                  </button>
+                )}
+                {onExportPDF && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onClose();
+                      onExportPDF();
+                    }}
+                    className="min-h-[42px] px-3.5 py-2 rounded-xl bg-white hover:bg-teal-50 text-teal-900 border border-teal-200 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Download size={14} className="text-teal-700" />
+                    <span>In / Xuất PDF nhanh</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* SECTION 0: GOOGLE DRIVE SYNC & ANDROID TWA / CAPACITOR AUTH */}
           <div className="rounded-2xl border border-sky-200 p-4 bg-sky-50/30 shadow-2xs space-y-3.5">
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -351,70 +450,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <span className="font-mono font-semibold text-slate-800">{DRIVE_BACKUP_FILENAME}</span> trên Google Drive (phạm vi quyền <span className="font-mono">drive.file</span>) và luôn cập nhật đúng file đó để đồng bộ giữa nhiều máy.
             </p>
 
-            {/* Google Client ID Input (Requirement 1) */}
-            <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-2">
-              <div className="flex items-center justify-between">
-                <label className="block text-xs font-semibold text-slate-800">
-                  Google Client ID cá nhân (Google Identity Services):
-                </label>
-                {googleClientId.trim() ? (
-                  <span className="text-[10px] font-semibold text-sky-800 bg-sky-50 px-2 py-0.5 rounded-md border border-sky-200">
-                    Đang dùng Client ID riêng
-                  </span>
-                ) : hasBuiltInClientId ? (
-                  <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
-                    Đã có sẵn OAuth mặc định
-                  </span>
-                ) : null}
-              </div>
-
-              <div className="relative flex items-center">
-                <input
-                  type="text"
-                  value={googleClientId}
-                  onChange={(e) => setGoogleClientId(e.target.value)}
-                  placeholder="VD: 123456789-abcdef.apps.googleusercontent.com (Để trống nếu dùng mặc định)"
-                  className="w-full min-h-[42px] pl-3 pr-10 text-xs font-mono rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 bg-slate-50/50"
-                />
-                {googleClientId && (
-                  <button
-                    type="button"
-                    onClick={handleClearGoogleClientId}
-                    className="absolute right-1.5 min-h-[34px] min-w-[34px] flex items-center justify-center text-rose-500 hover:text-rose-700 rounded-lg cursor-pointer"
-                    title="Xóa Google Client ID"
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                )}
-              </div>
-
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={handleSaveGoogleClientId}
-                  className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  Lưu Google Client ID vào máy
-                </button>
-                <a
-                  href="https://console.cloud.google.com/apis/credentials"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[11px] font-medium text-sky-700 hover:text-sky-900 flex items-center gap-1"
-                >
-                  <span>Tạo Client ID trên Google Cloud</span>
-                  <ExternalLink size={12} />
-                </a>
-              </div>
-
-              {clientIdStatus.message && (
-                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-[11px] flex items-center gap-1.5">
-                  <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
-                  <span>{clientIdStatus.message}</span>
-                </div>
-              )}
-            </div>
-
             {/* Sign-in / Account & Sync Controls */}
             <div className="p-3.5 rounded-xl bg-white border border-sky-200/80 space-y-3">
               {!isDriveConnected ? (
@@ -426,7 +461,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         : 'Kết nối tài khoản Google Drive'}
                     </div>
                     <p className="text-[11px] text-slate-500">
-                      Xin quyền <span className="font-mono">drive.file</span> (chỉ truy cập đúng file sao lưu do ứng dụng tạo ra).
+                      {standaloneEnv.isStandalone
+                        ? 'Đã phát hiện chế độ App đóng gói/TWA: tự động dùng signInWithRedirect an toàn.'
+                        : 'Xin quyền drive.file (chỉ truy cập file sao lưu do ứng dụng tạo ra).'}
                     </p>
                   </div>
                   <GoogleSignInButton
@@ -530,15 +567,246 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               )}
 
               {driveError && (
-                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 text-xs flex items-start gap-2">
-                  <AlertCircle size={15} className="text-rose-600 shrink-0 mt-0.5" />
-                  <div className="flex-1">{driveError.message}</div>
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 text-xs space-y-1.5">
+                  <div className="flex items-start gap-2">
+                    <AlertCircle size={15} className="text-rose-600 shrink-0 mt-0.5" />
+                    <div className="flex-1 font-medium leading-relaxed">{driveError.message}</div>
+                  </div>
+                  {driveError.firebaseErrorCode && (
+                    <div className="pl-6 text-[11px] font-mono text-rose-700">
+                      Mã lỗi Firebase: {driveError.firebaseErrorCode}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Requirement 1, 2, 3, 4: Android APK / TWA Auth Mode & authDomain Configuration */}
+            <div className="p-3.5 rounded-xl bg-white border border-slate-200 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                  <Globe size={14} className="text-sky-700" />
+                  <span>Chế độ đăng nhập &amp; Cấu hình authDomain (Android TWA / APK)</span>
+                </span>
+                <span
+                  className={`text-[10px] font-semibold px-2 py-0.5 rounded-md border ${
+                    standaloneEnv.isStandalone
+                      ? 'bg-amber-50 text-amber-900 border-amber-200'
+                      : 'bg-slate-100 text-slate-700 border-slate-200'
+                  }`}
+                >
+                  {standaloneEnv.isStandalone ? 'Chế độ Standalone / APK' : 'Trình duyệt Web'}
+                </span>
+              </div>
+
+              {/* Auth Flow Mode Selector */}
+              <div className="space-y-1.5">
+                <label className="block text-[11px] font-semibold text-slate-700">
+                  Phương thức xác thực Firebase Google:
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => handleChangeAuthFlowPref('auto')}
+                    className={`px-2.5 py-2 rounded-xl text-[11px] font-semibold border text-left transition-colors cursor-pointer ${
+                      authFlowPref === 'auto'
+                        ? 'bg-sky-50 border-sky-500 text-sky-900'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div className="font-bold">Tự động (Khuyên dùng)</div>
+                    <div className="text-[10px] opacity-80">
+                      APK/TWA dùng Redirect, Web dùng Popup
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleChangeAuthFlowPref('redirect')}
+                    className={`px-2.5 py-2 rounded-xl text-[11px] font-semibold border text-left transition-colors cursor-pointer ${
+                      authFlowPref === 'redirect'
+                        ? 'bg-sky-50 border-sky-500 text-sky-900'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div className="font-bold">Luôn dùng Redirect</div>
+                    <div className="text-[10px] opacity-80">
+                      signInWithRedirect + getRedirectResult
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleChangeAuthFlowPref('popup')}
+                    className={`px-2.5 py-2 rounded-xl text-[11px] font-semibold border text-left transition-colors cursor-pointer ${
+                      authFlowPref === 'popup'
+                        ? 'bg-sky-50 border-sky-500 text-sky-900'
+                        : 'bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div className="font-bold">Ưu tiên Popup</div>
+                    <div className="text-[10px] opacity-80">
+                      signInWithPopup (Tự chuyển Redirect nếu lỗi)
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Requirement 4: Firebase authDomain Verification */}
+              <div className="space-y-1.5 pt-1 border-t border-slate-100">
+                <div className="flex flex-wrap items-center justify-between gap-1">
+                  <label className="text-[11px] font-semibold text-slate-700">
+                    Tên miền xác thực Firebase (<span className="font-mono">authDomain</span>):
+                  </label>
+                  <span className="text-[10px] font-mono text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                    Đang dùng: {effectiveAuthDomain}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={customAuthDomain}
+                    onChange={(e) => setCustomAuthDomain(e.target.value)}
+                    placeholder={`Mặc định: ${DEFAULT_FIREBASE_AUTH_DOMAIN}`}
+                    className="flex-1 min-h-[38px] px-3 text-xs font-mono rounded-xl border border-slate-300 bg-slate-50/50 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveCustomAuthDomain}
+                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold transition-colors cursor-pointer shrink-0"
+                  >
+                    Lưu domain
+                  </button>
+                </div>
+                {authDomainSavedMsg && (
+                  <div className="text-[11px] text-emerald-700 font-medium">
+                    {authDomainSavedMsg}
+                  </div>
+                )}
+              </div>
+
+              {/* Requirement 3: Diagnostic Log of getRedirectResult & Environment */}
+              <div className="pt-1 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDiagLog(getLastAuthDiagnosticLog());
+                    setShowDiagDetails(!showDiagDetails);
+                  }}
+                  className="text-[11px] font-semibold text-sky-700 hover:text-sky-900 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Terminal size={13} />
+                  <span>
+                    {showDiagDetails
+                      ? 'Ẩn thông tin chẩn đoán getRedirectResult & TWA'
+                      : 'Xem tham số trả về từ getRedirectResult & chẩn đoán TWA/APK'}
+                  </span>
+                </button>
+
+                {showDiagDetails && (
+                  <div className="mt-2 p-2.5 rounded-xl bg-slate-900 text-slate-100 text-[11px] font-mono space-y-1.5 overflow-x-auto">
+                    <div>
+                      <span className="text-sky-400">Môi trường phát hiện:</span>{' '}
+                      {standaloneEnv.modeLabel}
+                    </div>
+                    <div>
+                      <span className="text-sky-400">Origin hiện tại:</span>{' '}
+                      {typeof window !== 'undefined' ? window.location.origin : ''}
+                    </div>
+                    <div>
+                      <span className="text-sky-400">Firebase authDomain:</span>{' '}
+                      {effectiveAuthDomain}
+                    </div>
+                    <div>
+                      <span className="text-sky-400">Chi tiết cờ Standalone:</span>{' '}
+                      {JSON.stringify(standaloneEnv.details)}
+                    </div>
+                    {diagLog && (
+                      <div className="pt-1 border-t border-slate-700 space-y-1">
+                        <div className="text-emerald-400">
+                          [Log getRedirectResult lúc {diagLog.timestamp} - luồng: {diagLog.flowUsed}]
+                        </div>
+                        {diagLog.errorCode && (
+                          <div className="text-rose-400">
+                            Mã lỗi Firebase: {diagLog.errorCode} — {diagLog.errorMessage}
+                          </div>
+                        )}
+                        <pre className="text-[10px] text-slate-300 whitespace-pre-wrap break-all">
+                          {JSON.stringify(diagLog.redirectResultParams, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Google Client ID Input (Optional GIS override) */}
+            <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-2">
+              <div className="flex items-center justify-between">
+                <label className="block text-xs font-semibold text-slate-800">
+                  Google Client ID cá nhân (Tùy chọn - Google Identity Services):
+                </label>
+                {googleClientId.trim() ? (
+                  <span className="text-[10px] font-semibold text-sky-800 bg-sky-50 px-2 py-0.5 rounded-md border border-sky-200">
+                    Đang dùng Client ID riêng
+                  </span>
+                ) : hasBuiltInClientId ? (
+                  <span className="text-[10px] font-semibold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded-md border border-emerald-200">
+                    Đang dùng Firebase OAuth mặc định
+                  </span>
+                ) : null}
+              </div>
+
+              <div className="relative flex items-center">
+                <input
+                  type="text"
+                  value={googleClientId}
+                  onChange={(e) => setGoogleClientId(e.target.value)}
+                  placeholder="VD: 123456789-abcdef.apps.googleusercontent.com (Để trống nếu dùng mặc định)"
+                  className="w-full min-h-[42px] pl-3 pr-10 text-xs font-mono rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-sky-500 bg-slate-50/50"
+                />
+                {googleClientId && (
+                  <button
+                    type="button"
+                    onClick={handleClearGoogleClientId}
+                    className="absolute right-1.5 min-h-[34px] min-w-[34px] flex items-center justify-center text-rose-500 hover:text-rose-700 rounded-lg cursor-pointer"
+                    title="Xóa Google Client ID"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={handleSaveGoogleClientId}
+                  className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-xs font-semibold transition-colors cursor-pointer"
+                >
+                  Lưu Google Client ID vào máy
+                </button>
+                <a
+                  href="https://console.cloud.google.com/apis/credentials"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[11px] font-medium text-sky-700 hover:text-sky-900 flex items-center gap-1"
+                >
+                  <span>Tạo Client ID trên Google Cloud</span>
+                  <ExternalLink size={12} />
+                </a>
+              </div>
+
+              {clientIdStatus.message && (
+                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-900 text-[11px] flex items-center gap-1.5">
+                  <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
+                  <span>{clientIdStatus.message}</span>
                 </div>
               )}
             </div>
           </div>
 
-          {/* SECTION 1: Gemini API Key (Requirement 6) */}
+          {/* SECTION 1: Gemini API Key */}
           <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-2xs space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -654,7 +922,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          {/* SECTION 2: Auto-Download Local File (Requirement 2 & 4) */}
+          {/* SECTION 2: Auto-Download Local File */}
           <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-2xs space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -705,7 +973,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
           </div>
 
-          {/* SECTION 3: Persistent Storage (Requirement 3) */}
+          {/* SECTION 3: Persistent Storage */}
           <div className="rounded-2xl border border-slate-200 p-4 bg-white shadow-2xs space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -780,7 +1048,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
               <div className="flex items-center gap-2">
                 <CheckCircle2 size={14} className="text-teal-600" />
-                <span>Môi trường: {isNativeWrapper ? 'Android WebView / Native' : 'Trình duyệt PWA'}</span>
+                <span>
+                  Môi trường: {standaloneEnv.isStandalone || isNativeWrapper ? standaloneEnv.modeLabel : 'Trình duyệt Web'}
+                </span>
               </div>
             </div>
           </div>

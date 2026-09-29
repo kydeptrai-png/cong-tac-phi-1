@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Sparkles,
   ArrowRight,
@@ -13,6 +13,7 @@ import { NaturalExpenseParsed, ExpenseItem } from '../types';
 import { formatVND } from '../utils/categories';
 import { parseNaturalExpense } from '../utils/gemini';
 import { findDuplicateExpenses } from '../utils/db';
+import { saveNaturalInputDraft, loadNaturalInputDraft } from '../utils/googleDrive';
 
 interface NaturalExpenseInputProps {
   onAddExpense: (item: ExpenseItem) => void;
@@ -44,6 +45,33 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
   const [editDate, setEditDate] = useState('');
   const [editAmount, setEditAmount] = useState<number | string>('');
   const [editDescription, setEditDescription] = useState('');
+
+  // Restore draft on mount (Requirement 5: preserve unsaved input across redirect auth)
+  useEffect(() => {
+    const draft = loadNaturalInputDraft();
+    if (draft) {
+      if (draft.inputText) setInputText(draft.inputText);
+      if (draft.preview) {
+        setPreview(draft.preview);
+        setIsEditingPreview(Boolean(draft.isEditingPreview));
+        setEditDate(draft.editDate || draft.preview.ngay);
+        setEditAmount(draft.editAmount ?? draft.preview.so_tien);
+        setEditDescription(draft.editDescription || draft.preview.dien_giai);
+      }
+    }
+  }, []);
+
+  // Persist draft when typing or previewing
+  useEffect(() => {
+    saveNaturalInputDraft({
+      inputText,
+      preview,
+      isEditingPreview,
+      editDate,
+      editAmount,
+      editDescription,
+    });
+  }, [inputText, preview, isEditingPreview, editDate, editAmount, editDescription]);
 
   const examples = [
     'mua phở hết 150k',
@@ -163,6 +191,7 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
     }
 
     onAddExpense(newItem);
+    saveNaturalInputDraft(null);
 
     // Reset form
     setInputText('');

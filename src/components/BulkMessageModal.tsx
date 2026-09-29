@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   X,
   Sparkles,
@@ -13,6 +13,7 @@ import { ExpenseItem } from '../types';
 import { parseBulkExpenses } from '../utils/gemini';
 import { formatVND } from '../utils/categories';
 import { buildDuplicateKey } from '../utils/db';
+import { saveBulkModalDraft, loadBulkModalDraft } from '../utils/googleDrive';
 
 interface BulkMessageModalProps {
   isOpen: boolean;
@@ -44,6 +45,31 @@ export const BulkMessageModal: React.FC<BulkMessageModalProps> = ({
   const [previewRows, setPreviewRows] = useState<BulkPreviewRow[]>([]);
   const [usedFallback, setUsedFallback] = useState(false);
   const [duplicateAction, setDuplicateAction] = useState<'skip' | 'keep'>('keep');
+
+  // Restore draft when modal opens (Requirement 5: preserve unsaved input across redirect)
+  useEffect(() => {
+    if (!isOpen) return;
+    const draft = loadBulkModalDraft();
+    if (draft) {
+      if (draft.rawText && !rawText) setRawText(draft.rawText);
+      if (Array.isArray(draft.previewRows) && draft.previewRows.length > 0 && previewRows.length === 0) {
+        setPreviewRows(draft.previewRows);
+      }
+      if (draft.duplicateAction) {
+        setDuplicateAction(draft.duplicateAction);
+      }
+    }
+  }, [isOpen]);
+
+  // Persist draft when editing
+  useEffect(() => {
+    if (!isOpen) return;
+    saveBulkModalDraft({
+      rawText,
+      previewRows,
+      duplicateAction,
+    });
+  }, [isOpen, rawText, previewRows, duplicateAction]);
 
   // Compute duplicate status for each preview row
   const existingKeysSet = useMemo(() => {
@@ -203,6 +229,7 @@ Ngày 18/03/2026:
     });
 
     onConfirmAddBulk(newExpenses);
+    saveBulkModalDraft(null);
     setRawText('');
     setPreviewRows([]);
     setErrorMessage(null);

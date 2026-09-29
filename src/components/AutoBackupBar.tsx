@@ -31,7 +31,7 @@ interface AutoBackupBarProps {
   onToggleAutoDriveSync: (enabled: boolean) => void;
   driveSyncStatus: 'idle' | 'syncing' | 'synced' | 'error';
   lastDriveSyncTime: string | null;
-  driveError: { message: string; code: DriveErrorCode } | null;
+  driveError: { message: string; code: DriveErrorCode; firebaseErrorCode?: string } | null;
   onGoogleLogin: () => void;
   onGoogleLogout: () => void;
   onOpenDriveSyncModal: () => void;
@@ -175,17 +175,26 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
 
       {/* Error Banner for Google Drive if any error occurred */}
       {driveError && (
-        <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 flex flex-wrap items-center justify-between gap-2 text-[11px]">
-          <div className="flex items-center gap-2">
-            <AlertCircle size={15} className="text-rose-600 shrink-0" />
-            <span className="font-medium">{driveError.message}</span>
+        <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-900 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="flex items-start gap-2 flex-1 min-w-[240px]">
+            <AlertCircle size={15} className="text-rose-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              {driveError.firebaseErrorCode && (
+                <span className="inline-block px-1.5 py-0.5 rounded bg-rose-200/80 text-rose-950 font-mono font-bold text-[10px]">
+                  Mã lỗi Firebase: {driveError.firebaseErrorCode}
+                </span>
+              )}
+              <div className="font-medium leading-relaxed">{driveError.message}</div>
+            </div>
           </div>
-          <div className="flex items-center gap-1.5">
-            {driveError.code === 'TOKEN_EXPIRED' || driveError.code === 'PERMISSION_DENIED' ? (
+          <div className="flex items-center gap-1.5 shrink-0">
+            {driveError.code === 'TOKEN_EXPIRED' ||
+            driveError.code === 'PERMISSION_DENIED' ||
+            driveError.code === 'FIREBASE_AUTH_ERROR' ? (
               <button
                 type="button"
                 onClick={onGoogleLogin}
-                className="px-2.5 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-bold cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-bold cursor-pointer"
               >
                 Đăng nhập lại ngay
               </button>
@@ -193,7 +202,7 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
               <button
                 type="button"
                 onClick={onQuickSyncDriveNow}
-                className="px-2.5 py-1 rounded-lg bg-white hover:bg-rose-100 text-rose-800 border border-rose-300 font-semibold cursor-pointer"
+                className="px-3 py-1.5 rounded-lg bg-white hover:bg-rose-100 text-rose-800 border border-rose-300 font-semibold cursor-pointer"
               >
                 Thử đồng bộ lại
               </button>

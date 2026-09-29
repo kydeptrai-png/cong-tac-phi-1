@@ -2,8 +2,12 @@ import { initializeApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
+  browserLocalPersistence,
+  setPersistence,
   User,
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -11,6 +15,7 @@ import {
   ExpenseItem,
   AdvancePaymentItem,
   ExpenseProfile,
+  NaturalExpenseParsed,
 } from '../types';
 import {
   DEFAULT_PROFILE,
@@ -24,6 +29,14 @@ export const DRIVE_BACKUP_FILENAME = 'CongTacPhi_backup.json';
 
 // Non-sensitive metadata keys in localStorage (Access token is NEVER stored in localStorage/sessionStorage)
 export const USER_GOOGLE_CLIENT_ID_STORAGE = 'so_chi_tieu_google_client_id';
+export const USER_FIREBASE_AUTH_DOMAIN_STORAGE = 'so_chi_tieu_firebase_auth_domain';
+export const PREFERRED_AUTH_FLOW_STORAGE = 'so_chi_tieu_preferred_auth_flow';
+export const PENDING_REDIRECT_MARKER_STORAGE = 'so_chi_tieu_pending_auth_redirect';
+export const APP_UI_CONTEXT_STORAGE = 'so_chi_tieu_ui_context_snapshot';
+export const DRAFT_EXPENSE_MODAL_STORAGE = 'so_chi_tieu_draft_expense_modal';
+export const DRAFT_NATURAL_INPUT_STORAGE = 'so_chi_tieu_draft_natural_input';
+export const DRAFT_BULK_MODAL_STORAGE = 'so_chi_tieu_draft_bulk_modal';
+
 export const DRIVE_FILE_ID_STORAGE = 'so_chi_tieu_drive_backup_file_id';
 export const DRIVE_LAST_SYNC_TIME_STORAGE = 'so_chi_tieu_drive_last_sync_time';
 export const DRIVE_LAST_SYNC_ISO_STORAGE = 'so_chi_tieu_drive_last_sync_iso';
@@ -33,17 +46,231 @@ export const AUTO_DRIVE_SYNC_ENABLED_STORAGE = 'so_chi_tieu_auto_drive_sync_enab
 // Threshold for switching from multipart upload to resumable upload (3 MB)
 const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 3 * 1024 * 1024;
 
-// Initialize Firebase App & Auth
-const app = initializeApp(firebaseConfig);
+/**
+ * Requirement 4: Ensure authDomain in Firebase config is ALWAYS the exact deployed domain
+ * (`gen-lang-client-0900718817.firebaseapp.com` or custom deployed domain),
+ * and NEVER changed to `localhost` or `capacitor://localhost` when packaged as APK/TWA.
+ */
+export const DEFAULT_FIREBASE_AUTH_DOMAIN =
+  firebaseConfig.authDomain || 'gen-lang-client-0900718817.firebaseapp.com';
+
+export function getUserCustomAuthDomain(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    return localStorage.getItem(USER_FIREBASE_AUTH_DOMAIN_STORAGE)?.trim() || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setUserCustomAuthDomain(domain: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const cleaned = domain
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '');
+    if (cleaned && cleaned !== 'localhost' && !cleaned.startsWith('127.0.0.1')) {
+      localStorage.setItem(USER_FIREBASE_AUTH_DOMAIN_STORAGE, cleaned);
+    } else {
+      localStorage.removeItem(USER_FIREBASE_AUTH_DOMAIN_STORAGE);
+    }
+  } catch (err) {
+    console.warn('Failed to save custom authDomain:', err);
+  }
+}
+
+export function getEffectiveAuthDomain(): string {
+  const envDomain = (import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '').trim();
+  const customDomain = getUserCustomAuthDomain();
+  const candidate = customDomain || envDomain || DEFAULT_FIREBASE_AUTH_DOMAIN;
+
+  // Guard: Never allow localhost or capacitor:// schemes to overwrite authDomain in packaged APK
+  if (
+    !candidate ||
+    candidate === 'localhost' ||
+    candidate.startsWith('localhost:') ||
+    candidate.startsWith('127.0.0.1') ||
+    candidate.includes('capacitor://')
+  ) {
+    return DEFAULT_FIREBASE_AUTH_DOMAIN;
+  }
+  return candidate;
+}
+
+/**
+ * Requirement 2: Detect if running in Standalone / TWA / Capacitor / WebView mode
+ * so we automatically use `signInWithRedirect` + `getRedirectResult` instead of `signInWithPopup`.
+ */
+export interface StandaloneEnvironmentInfo {
+  isStandalone: boolean;
+  modeLabel: string;
+  reasons: string[];
+  details: {
+    displayModeStandalone: boolean;
+    isIOSStandalone: boolean;
+    isTWA: boolean;
+    isCapacitor: boolean;
+    isAndroidWebView: boolean;
+  };
+}
+
+export function detectStandaloneEnvironment(): StandaloneEnvironmentInfo {
+  if (typeof window === 'undefined') {
+    return {
+      isStandalone: false,
+      modeLabel: 'Web Browser',
+      reasons: [],
+      details: {
+        displayModeStandalone: false,
+        isIOSStandalone: false,
+        isTWA: false,
+        isCapacitor: false,
+        isAndroidWebView: false,
+      },
+    };
+  }
+
+  const reasons: string[] = [];
+
+  // 1. CSS display-mode: standalone / fullscreen / minimal-ui
+  const displayModeStandalone = Boolean(
+    window.matchMedia?.('(display-mode: standalone)').matches ||
+      window.matchMedia?.('(display-mode: fullscreen)').matches ||
+      window.matchMedia?.('(display-mode: minimal-ui)').matches
+  );
+  if (displayModeStandalone) {
+    reasons.push('display-mode: standalone');
+  }
+
+  // 2. iOS Safari standalone
+  const isIOSStandalone = Boolean((window.navigator as any)?.standalone === true);
+  if (isIOSStandalone) {
+    reasons.push('navigator.standalone (iOS)');
+  }
+
+  // 3. Android TWA (Trusted Web Activity)
+  const isTWA = Boolean(
+    typeof document !== 'undefined' && document.referrer?.startsWith('android-app://')
+  );
+  if (isTWA) {
+    reasons.push(`TWA (${document.referrer})`);
+  }
+
+  // 4. Capacitor runtime or VITE_CAPACITOR env variable
+  const cap = (window as any).Capacitor;
+  const isCapacitor = Boolean(
+    cap?.isNativePlatform?.() ||
+      cap?.isNative ||
+      (cap?.getPlatform && cap.getPlatform() !== 'web') ||
+      import.meta.env.VITE_CAPACITOR === 'true' ||
+      window.location.protocol === 'capacitor:'
+  );
+  if (isCapacitor) {
+    reasons.push('Capacitor Native/APK');
+  }
+
+  // 5. Android WebView userAgent indicator
+  const ua = window.navigator.userAgent || '';
+  const isAndroidWebView = Boolean(
+    /; wv\b/i.test(ua) || (/Android/i.test(ua) && /Version\/\d+\.\d+/i.test(ua))
+  );
+  if (isAndroidWebView) {
+    reasons.push('Android WebView');
+  }
+
+  const isStandalone =
+    displayModeStandalone || isIOSStandalone || isTWA || isCapacitor || isAndroidWebView;
+
+  const modeLabel = isStandalone
+    ? `App đóng gói / Standalone (${reasons.join(', ')})`
+    : 'Trình duyệt Web tiêu chuẩn';
+
+  return {
+    isStandalone,
+    modeLabel,
+    reasons,
+    details: {
+      displayModeStandalone,
+      isIOSStandalone,
+      isTWA,
+      isCapacitor,
+      isAndroidWebView,
+    },
+  };
+}
+
+export type AuthFlowPreference = 'auto' | 'redirect' | 'popup';
+
+export function getPreferredAuthFlowMode(): AuthFlowPreference {
+  if (typeof window === 'undefined') return 'auto';
+  try {
+    const val = localStorage.getItem(PREFERRED_AUTH_FLOW_STORAGE);
+    if (val === 'redirect' || val === 'popup' || val === 'auto') return val;
+    return 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+export function setPreferredAuthFlowMode(mode: AuthFlowPreference): void {
+  if (typeof window === 'undefined') return;
+  try {
+    localStorage.setItem(PREFERRED_AUTH_FLOW_STORAGE, mode);
+  } catch {
+    // ignore
+  }
+}
+
+export function shouldUseRedirectFlow(): boolean {
+  const pref = getPreferredAuthFlowMode();
+  if (pref === 'redirect') return true;
+  if (pref === 'popup') return false;
+  return detectStandaloneEnvironment().isStandalone;
+}
+
+// Initialize Firebase App & Auth with verified authDomain
+const resolvedFirebaseConfig = {
+  ...firebaseConfig,
+  authDomain: getEffectiveAuthDomain(),
+};
+
+const app = initializeApp(resolvedFirebaseConfig);
 const auth = getAuth(app);
+
+// Ensure persistence is browserLocalPersistence so redirect state is preserved across navigation
+setPersistence(auth, browserLocalPersistence).catch((err) => {
+  console.warn('[Firebase Auth] setPersistence warning:', err);
+});
 
 const provider = new GoogleAuthProvider();
 SCOPES.forEach((scope) => provider.addScope(scope));
+provider.setCustomParameters({
+  prompt: 'select_account',
+});
 
 // In-memory only access token cache (NEVER persisted to localStorage or sessionStorage)
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
 let cachedUserInfo: GoogleDriveUser | null = null;
+
+// Diagnostic log of the latest getRedirectResult / Auth operation for debugging on Android
+export interface AuthDiagnosticLog {
+  timestamp: string;
+  flowUsed: 'redirect' | 'popup' | 'gis' | 'startup_check';
+  authDomain: string;
+  currentOrigin: string;
+  environment: string;
+  redirectResultParams?: Record<string, any> | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+let lastAuthDiagnosticLog: AuthDiagnosticLog | null = null;
+
+export function getLastAuthDiagnosticLog(): AuthDiagnosticLog | null {
+  return lastAuthDiagnosticLog;
+}
 
 export interface GoogleDriveUser {
   uid: string;
@@ -66,14 +293,296 @@ export type DriveErrorCode =
   | 'PERMISSION_DENIED'
   | 'NOT_FOUND'
   | 'MISSING_CLIENT_ID'
+  | 'FIREBASE_AUTH_ERROR'
   | 'UNKNOWN';
 
 export class DriveSyncError extends Error {
   code: DriveErrorCode;
-  constructor(message: string, code: DriveErrorCode = 'UNKNOWN') {
+  firebaseErrorCode?: string;
+  constructor(
+    message: string,
+    code: DriveErrorCode = 'UNKNOWN',
+    firebaseErrorCode?: string
+  ) {
     super(message);
     this.name = 'DriveSyncError';
     this.code = code;
+    this.firebaseErrorCode = firebaseErrorCode;
+  }
+}
+
+/**
+ * Requirement 3: Format Firebase Auth error with explicit Firebase error code
+ * (`auth/invalid-action-code`, `auth/unauthorized-domain`, etc.) so it is clearly shown on screen.
+ */
+export function formatFirebaseAuthError(error: any, context: string): DriveSyncError {
+  const fbCode: string = error?.code || 'auth/unknown-error';
+  const rawMsg: string = error?.message || 'Lỗi không xác định từ Firebase Authentication';
+
+  console.error(`[Firebase Auth Error in ${context}]`, {
+    code: fbCode,
+    message: rawMsg,
+    email: error?.customData?.email || error?.email || null,
+    customData: error?.customData || null,
+    authDomain: getEffectiveAuthDomain(),
+    origin: typeof window !== 'undefined' ? window.location.origin : '',
+    href: typeof window !== 'undefined' ? window.location.href : '',
+    standalone: detectStandaloneEnvironment(),
+    rawError: error,
+  });
+
+  let friendlyExplanation = '';
+
+  switch (fbCode) {
+    case 'auth/invalid-action-code':
+      friendlyExplanation =
+        `Lỗi [${fbCode}] ("The requested action is invalid"): Phiên chuyển hướng đăng nhập trên firebaseapp.com không hợp lệ hoặc đã hết hạn do trình duyệt trong APK/TWA chặn trạng thái trung gian. ` +
+        `Cách khắc phục: (1) Hãy thử chọn chế độ "Luôn dùng Redirect" hoặc dán Google Client ID trong Cài đặt; (2) Kiểm tra tên miền "${window.location.hostname}" và "${getEffectiveAuthDomain()}" đã có trong Firebase Console → Authentication → Settings → Authorized domains.`;
+      break;
+
+    case 'auth/unauthorized-domain':
+      friendlyExplanation =
+        `Lỗi [${fbCode}]: Tên miền hiện tại (${window.location.origin}) chưa được cấp phép trong Firebase Authentication. ` +
+        `Vui lòng vào Firebase Console → Authentication → Settings → Authorized domains và thêm "${window.location.hostname}".`;
+      break;
+
+    case 'auth/operation-not-supported-in-this-environment':
+      friendlyExplanation =
+        `Lỗi [${fbCode}]: Môi trường hiện tại (WebView / APK) không hỗ trợ phương thức đăng nhập này hoặc chưa bật DOM Storage. Ứng dụng đã chuyển sang chế độ Redirect.`;
+      break;
+
+    case 'auth/web-storage-unsupported':
+      friendlyExplanation =
+        `Lỗi [${fbCode}]: Trình duyệt hoặc WebView đang tắt Cookie / Web Storage của bên thứ ba nên không lưu được phiên đăng nhập.`;
+      break;
+
+    case 'auth/popup-blocked':
+      friendlyExplanation =
+        `Lỗi [${fbCode}]: Cửa sổ đăng nhập (Popup) bị chặn trên thiết bị này. Vui lòng thử lại để đăng nhập bằng chế độ chuyển hướng (Redirect).`;
+      break;
+
+    case 'auth/popup-closed-by-user':
+    case 'auth/cancelled-popup-request':
+      friendlyExplanation = `Lỗi [${fbCode}]: Cửa sổ đăng nhập Google đã bị đóng trước khi hoàn tất (${rawMsg}).`;
+      break;
+
+    case 'auth/network-request-failed':
+      friendlyExplanation = `Lỗi [${fbCode}]: Lỗi kết nối mạng khi liên lạc với máy chủ xác thực Google Firebase.`;
+      break;
+
+    default:
+      friendlyExplanation = `Lỗi xác thực Firebase [${fbCode}] khi ${context}: ${rawMsg}`;
+      break;
+  }
+
+  return new DriveSyncError(friendlyExplanation, 'FIREBASE_AUTH_ERROR', fbCode);
+}
+
+/**
+ * Requirement 5: Save & Restore App State and Unsaved Input Drafts across `signInWithRedirect`
+ */
+export interface AppUIContextSnapshot {
+  currentTab: 'expenses' | 'dashboard';
+  viewMode: 'table' | 'card';
+  activeProfileId: string;
+  selectedMonth: string;
+  searchTerm: string;
+  startDate: string;
+  endDate: string;
+  minAmount: number | '';
+  maxAmount: number | '';
+  receiptFilter: 'all' | 'has_receipt' | 'no_receipt';
+  onlyMissingReceipts: boolean;
+  openModal: 'none' | 'expense' | 'bulk' | 'settings' | 'export' | 'import' | 'pdf';
+  editingExpense: ExpenseItem | null;
+  defaultMonthForNew: string;
+  pendingDriveSyncAfterAuth: boolean;
+  savedAt: number;
+}
+
+export function saveAppUIContextSnapshot(snapshot: AppUIContextSnapshot): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.setItem(APP_UI_CONTEXT_STORAGE, JSON.stringify(snapshot));
+    localStorage.setItem(APP_UI_CONTEXT_STORAGE, JSON.stringify(snapshot));
+  } catch (err) {
+    console.warn('Could not save UI context snapshot:', err);
+  }
+}
+
+export function loadAppUIContextSnapshot(): AppUIContextSnapshot | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw =
+      sessionStorage.getItem(APP_UI_CONTEXT_STORAGE) ||
+      localStorage.getItem(APP_UI_CONTEXT_STORAGE);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as AppUIContextSnapshot;
+    // Valid for 30 minutes
+    if (Date.now() - (parsed.savedAt || 0) > 30 * 60 * 1000) {
+      clearAppUIContextSnapshot();
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function clearAppUIContextSnapshot(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem(APP_UI_CONTEXT_STORAGE);
+    localStorage.removeItem(APP_UI_CONTEXT_STORAGE);
+  } catch {
+    // ignore
+  }
+}
+
+// Drafts for ExpenseModal, NaturalExpenseInput, BulkMessageModal so unsaved input is never lost on redirect
+export interface ExpenseModalDraft {
+  editingItemId: string | null;
+  description: string;
+  amount: number | '';
+  month: string;
+  date: string;
+  notes: string;
+  images: string[];
+  naturalText: string;
+  updatedAt: number;
+}
+
+export function saveExpenseModalDraft(draft: ExpenseModalDraft | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!draft) {
+      sessionStorage.removeItem(DRAFT_EXPENSE_MODAL_STORAGE);
+      localStorage.removeItem(DRAFT_EXPENSE_MODAL_STORAGE);
+    } else {
+      const serialized = JSON.stringify(draft);
+      sessionStorage.setItem(DRAFT_EXPENSE_MODAL_STORAGE, serialized);
+      localStorage.setItem(DRAFT_EXPENSE_MODAL_STORAGE, serialized);
+    }
+  } catch {
+    // Ignore quota errors if many large images in draft
+  }
+}
+
+export function loadExpenseModalDraft(): ExpenseModalDraft | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw =
+      sessionStorage.getItem(DRAFT_EXPENSE_MODAL_STORAGE) ||
+      localStorage.getItem(DRAFT_EXPENSE_MODAL_STORAGE);
+    if (!raw) return null;
+    return JSON.parse(raw) as ExpenseModalDraft;
+  } catch {
+    return null;
+  }
+}
+
+export interface NaturalInputDraft {
+  inputText: string;
+  preview: NaturalExpenseParsed | null;
+  isEditingPreview: boolean;
+  editDate: string;
+  editAmount: number | string;
+  editDescription: string;
+}
+
+export function saveNaturalInputDraft(draft: NaturalInputDraft | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!draft || (!draft.inputText.trim() && !draft.preview)) {
+      sessionStorage.removeItem(DRAFT_NATURAL_INPUT_STORAGE);
+      localStorage.removeItem(DRAFT_NATURAL_INPUT_STORAGE);
+    } else {
+      const serialized = JSON.stringify(draft);
+      sessionStorage.setItem(DRAFT_NATURAL_INPUT_STORAGE, serialized);
+      localStorage.setItem(DRAFT_NATURAL_INPUT_STORAGE, serialized);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function loadNaturalInputDraft(): NaturalInputDraft | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw =
+      sessionStorage.getItem(DRAFT_NATURAL_INPUT_STORAGE) ||
+      localStorage.getItem(DRAFT_NATURAL_INPUT_STORAGE);
+    if (!raw) return null;
+    return JSON.parse(raw) as NaturalInputDraft;
+  } catch {
+    return null;
+  }
+}
+
+export interface BulkModalDraft {
+  rawText: string;
+  previewRows: Array<{
+    tempId: string;
+    date: string;
+    amount: number;
+    description: string;
+  }>;
+  duplicateAction: 'skip' | 'keep';
+}
+
+export function saveBulkModalDraft(draft: BulkModalDraft | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!draft || (!draft.rawText.trim() && draft.previewRows.length === 0)) {
+      sessionStorage.removeItem(DRAFT_BULK_MODAL_STORAGE);
+      localStorage.removeItem(DRAFT_BULK_MODAL_STORAGE);
+    } else {
+      const serialized = JSON.stringify(draft);
+      sessionStorage.setItem(DRAFT_BULK_MODAL_STORAGE, serialized);
+      localStorage.setItem(DRAFT_BULK_MODAL_STORAGE, serialized);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+export function loadBulkModalDraft(): BulkModalDraft | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw =
+      sessionStorage.getItem(DRAFT_BULK_MODAL_STORAGE) ||
+      localStorage.getItem(DRAFT_BULK_MODAL_STORAGE);
+    if (!raw) return null;
+    return JSON.parse(raw) as BulkModalDraft;
+  } catch {
+    return null;
+  }
+}
+
+function setPendingRedirectMarker(pending: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (pending) {
+      localStorage.setItem(
+        PENDING_REDIRECT_MARKER_STORAGE,
+        JSON.stringify({ startedAt: Date.now(), href: window.location.href })
+      );
+    } else {
+      localStorage.removeItem(PENDING_REDIRECT_MARKER_STORAGE);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function getPendingRedirectMarker(): { startedAt: number; href: string } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(PENDING_REDIRECT_MARKER_STORAGE);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
   }
 }
 
@@ -297,10 +806,11 @@ export async function signInWithGIS(
             isSigningIn = false;
             reject(
               new DriveSyncError(
-                `Đăng nhập Google thất bại: ${
+                `Đăng nhập Google (GIS) thất bại [${tokenResponse.error}]: ${
                   tokenResponse.error_description || tokenResponse.error
                 }`,
-                tokenResponse.error === 'access_denied' ? 'PERMISSION_DENIED' : 'UNKNOWN'
+                tokenResponse.error === 'access_denied' ? 'PERMISSION_DENIED' : 'UNKNOWN',
+                tokenResponse.error
               )
             );
             return;
@@ -309,11 +819,12 @@ export async function signInWithGIS(
           const token = tokenResponse?.access_token;
           if (!token) {
             isSigningIn = false;
-            reject(new DriveSyncError('Không nhận được mã truy cập (Access Token) từ Google.', 'UNKNOWN'));
+            reject(
+              new DriveSyncError('Không nhận được mã truy cập (Access Token) từ Google.', 'UNKNOWN')
+            );
             return;
           }
 
-          // Check that drive.file scope was granted
           if (
             token2HasRequiredScope(tokenResponse, 'https://www.googleapis.com/auth/drive.file') ===
             false
@@ -329,8 +840,6 @@ export async function signInWithGIS(
           }
 
           cachedAccessToken = token;
-
-          // Fetch user profile info via Drive about endpoint (works with drive.file scope without needing extra scopes!)
           const driveUser = await fetchDriveUserInfo(token);
           cachedUserInfo = driveUser;
           isSigningIn = false;
@@ -417,12 +926,159 @@ async function fetchDriveUserInfo(accessToken: string): Promise<GoogleDriveUser>
 }
 
 /**
- * Initialize auth state listener. Call this on app load.
+ * Requirement 1, 2, 3, 5:
+ * Initialize auth state listener AND process `getRedirectResult(auth)` when the app starts up.
+ * - Logs all returned parameters from `getRedirectResult`
+ * - Catches and surfaces specific Firebase error codes (`auth/invalid-action-code`, `auth/unauthorized-domain`, etc.)
+ * - Restores session and triggers callback when returning from redirect login
  */
 export const initAuth = (
-  onAuthSuccess?: (user: GoogleDriveUser, token: string) => void,
-  onAuthFailure?: (userWithoutToken?: GoogleDriveUser | null) => void
+  onAuthSuccess?: (user: GoogleDriveUser, token: string, isFromRedirect?: boolean) => void,
+  onAuthFailure?: (userWithoutToken?: GoogleDriveUser | null) => void,
+  onRedirectError?: (err: DriveSyncError) => void
 ) => {
+  const envInfo = detectStandaloneEnvironment();
+  const pendingRedirect = getPendingRedirectMarker();
+
+  // Check URL for any explicit OAuth error query parameters returned from redirect handler
+  if (typeof window !== 'undefined') {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlError = urlParams.get('error') || urlParams.get('errorCode');
+      const urlErrorDesc = urlParams.get('error_description') || urlParams.get('errorMessage');
+      if (urlError) {
+        console.error('[Firebase Auth URL Error Param]:', { urlError, urlErrorDesc });
+        const errObj = new DriveSyncError(
+          `Lỗi trả về từ trang đăng nhập [${urlError}]: ${urlErrorDesc || urlError}`,
+          'FIREBASE_AUTH_ERROR',
+          urlError
+        );
+        if (onRedirectError) onRedirectError(errObj);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Requirement 1 & 3: Call getRedirectResult(auth) on app startup and log all returned parameters
+  isSigningIn = true;
+  getRedirectResult(auth)
+    .then((result) => {
+      const credential = result ? GoogleAuthProvider.credentialFromResult(result) : null;
+      const tokenFromCredential =
+        credential?.accessToken || (result as any)?._tokenResponse?.oauthAccessToken || null;
+
+      const diagnosticPayload = {
+        hasResult: Boolean(result),
+        hadPendingRedirectMarker: Boolean(pendingRedirect),
+        operationType: result?.operationType || null,
+        providerId: result?.providerId || null,
+        authDomain: getEffectiveAuthDomain(),
+        currentOrigin: typeof window !== 'undefined' ? window.location.origin : '',
+        environment: envInfo.modeLabel,
+        user: result?.user
+          ? {
+              uid: result.user.uid,
+              email: result.user.email,
+              displayName: result.user.displayName,
+              photoURL: result.user.photoURL,
+              emailVerified: result.user.emailVerified,
+            }
+          : null,
+        credential: credential
+          ? {
+              providerId: credential.providerId,
+              signInMethod: credential.signInMethod,
+              hasAccessToken: Boolean(credential.accessToken),
+              hasIdToken: Boolean(credential.idToken),
+            }
+          : null,
+        tokenResponseSummary: (result as any)?._tokenResponse
+          ? {
+              hasOauthAccessToken: Boolean((result as any)._tokenResponse.oauthAccessToken),
+              email: (result as any)._tokenResponse.email || null,
+              federatedId: (result as any)._tokenResponse.federatedId || null,
+            }
+          : null,
+      };
+
+      console.log('[Firebase Auth] getRedirectResult startup inspection:', diagnosticPayload);
+
+      lastAuthDiagnosticLog = {
+        timestamp: new Date().toLocaleTimeString('vi-VN'),
+        flowUsed: result ? 'redirect' : 'startup_check',
+        authDomain: getEffectiveAuthDomain(),
+        currentOrigin: typeof window !== 'undefined' ? window.location.origin : '',
+        environment: envInfo.modeLabel,
+        redirectResultParams: diagnosticPayload,
+        errorCode: null,
+        errorMessage: null,
+      };
+
+      setPendingRedirectMarker(false);
+
+      if (result && result.user) {
+        const mappedUser: GoogleDriveUser = {
+          uid: result.user.uid,
+          displayName: result.user.displayName,
+          email: result.user.email,
+          photoURL: result.user.photoURL,
+          authMethod: 'firebase',
+        };
+        cachedUserInfo = mappedUser;
+
+        if (tokenFromCredential) {
+          cachedAccessToken = tokenFromCredential;
+          isSigningIn = false;
+          if (onAuthSuccess) {
+            onAuthSuccess(mappedUser, tokenFromCredential, true);
+          }
+          return;
+        } else {
+          // User returned from redirect but credential had no OAuth accessToken
+          console.warn(
+            '[Firebase Auth] getRedirectResult returned user without OAuth accessToken:',
+            diagnosticPayload
+          );
+          isSigningIn = false;
+          if (onRedirectError) {
+            onRedirectError(
+              new DriveSyncError(
+                'Đăng nhập Redirect thành công nhưng chưa lấy được Access Token cho Google Drive. Vui lòng bấm "Đăng nhập lại" hoặc dán Google Client ID trong Cài đặt.',
+                'TOKEN_EXPIRED',
+                'auth/missing-oauth-access-token'
+              )
+            );
+          }
+        }
+      } else {
+        isSigningIn = false;
+      }
+    })
+    .catch((error: any) => {
+      isSigningIn = false;
+      setPendingRedirectMarker(false);
+
+      const formattedErr = formatFirebaseAuthError(error, 'getRedirectResult');
+      lastAuthDiagnosticLog = {
+        timestamp: new Date().toLocaleTimeString('vi-VN'),
+        flowUsed: 'redirect',
+        authDomain: getEffectiveAuthDomain(),
+        currentOrigin: typeof window !== 'undefined' ? window.location.origin : '',
+        environment: envInfo.modeLabel,
+        redirectResultParams: {
+          customData: error?.customData || null,
+          email: error?.customData?.email || error?.email || null,
+        },
+        errorCode: error?.code || 'auth/unknown',
+        errorMessage: formattedErr.message,
+      };
+
+      if (onRedirectError) {
+        onRedirectError(formattedErr);
+      }
+    });
+
   return onAuthStateChanged(auth, async (user: User | null) => {
     if (user) {
       const mappedUser: GoogleDriveUser = {
@@ -435,15 +1091,15 @@ export const initAuth = (
       cachedUserInfo = mappedUser;
 
       if (cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(mappedUser, cachedAccessToken);
+        if (onAuthSuccess) onAuthSuccess(mappedUser, cachedAccessToken, false);
       } else if (!isSigningIn) {
         cachedAccessToken = null;
         if (onAuthFailure) onAuthFailure(mappedUser);
       }
     } else {
       if (cachedUserInfo?.authMethod === 'gis' && cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(cachedUserInfo, cachedAccessToken);
-      } else {
+        if (onAuthSuccess) onAuthSuccess(cachedUserInfo, cachedAccessToken, false);
+      } else if (!isSigningIn) {
         cachedAccessToken = null;
         cachedUserInfo = null;
         if (onAuthFailure) onAuthFailure(null);
@@ -454,10 +1110,16 @@ export const initAuth = (
 
 /**
  * Sign in with Google:
- * - If the user pasted a custom Google Client ID in Settings, uses Google Identity Services (GIS) with that Client ID.
- * - Otherwise uses Firebase Auth popup (provisioned for the app), with fallback to GIS if needed.
+ * 1. If user pasted a custom Google Client ID in Settings -> uses GIS TokenClient.
+ * 2. If running in Standalone / TWA / Capacitor (`shouldUseRedirectFlow() === true`) ->
+ *    saves app context & unsaved drafts, then calls `signInWithRedirect(auth, provider)`.
+ * 3. Otherwise on standard web -> uses `signInWithPopup(auth, provider)`, and if popup fails
+ *    or is unsupported (`auth/operation-not-supported-in-this-environment`, `auth/popup-blocked`, `auth/invalid-action-code`),
+ *    automatically switches to `signInWithRedirect(auth, provider)`.
  */
-export const googleSignIn = async (): Promise<{
+export const googleSignIn = async (
+  onBeforeRedirect?: () => void
+): Promise<{
   user: GoogleDriveUser;
   accessToken: string;
 } | null> => {
@@ -473,18 +1135,50 @@ export const googleSignIn = async (): Promise<{
     return await signInWithGIS(customClientId);
   }
 
+  const envInfo = detectStandaloneEnvironment();
+  const useRedirect = shouldUseRedirectFlow();
+
+  if (useRedirect) {
+    console.log('[Firebase Auth] Using signInWithRedirect for standalone/packaged environment:', {
+      authDomain: getEffectiveAuthDomain(),
+      origin: window.location.origin,
+      envInfo,
+    });
+    if (onBeforeRedirect) {
+      onBeforeRedirect();
+    }
+    setPendingRedirectMarker(true);
+    try {
+      isSigningIn = true;
+      await signInWithRedirect(auth, provider);
+      return null; // Browser will redirect
+    } catch (redirectInitErr: any) {
+      isSigningIn = false;
+      setPendingRedirectMarker(false);
+      throw formatFirebaseAuthError(redirectInitErr, 'signInWithRedirect');
+    }
+  }
+
+  // Standard Web Browser: Try signInWithPopup first, fallback to signInWithRedirect if needed
   try {
     isSigningIn = true;
+    console.log('[Firebase Auth] Attempting signInWithPopup on web browser...', {
+      authDomain: getEffectiveAuthDomain(),
+      origin: window.location.origin,
+    });
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
+    const token =
+      credential?.accessToken || (result as any)?._tokenResponse?.oauthAccessToken || null;
+
+    if (!token) {
       throw new DriveSyncError(
         'Không lấy được Access Token từ phiên đăng nhập Google.',
         'TOKEN_EXPIRED'
       );
     }
 
-    cachedAccessToken = credential.accessToken;
+    cachedAccessToken = token;
     const mappedUser: GoogleDriveUser = {
       uid: result.user.uid,
       displayName: result.user.displayName,
@@ -493,28 +1187,61 @@ export const googleSignIn = async (): Promise<{
       authMethod: 'firebase',
     };
     cachedUserInfo = mappedUser;
-    return { user: mappedUser, accessToken: cachedAccessToken };
+
+    lastAuthDiagnosticLog = {
+      timestamp: new Date().toLocaleTimeString('vi-VN'),
+      flowUsed: 'popup',
+      authDomain: getEffectiveAuthDomain(),
+      currentOrigin: window.location.origin,
+      environment: envInfo.modeLabel,
+      redirectResultParams: {
+        uid: mappedUser.uid,
+        email: mappedUser.email,
+        hasAccessToken: true,
+      },
+      errorCode: null,
+      errorMessage: null,
+    };
+
+    return { user: mappedUser, accessToken: token };
   } catch (error: any) {
-    console.warn('Firebase Auth popup error, checking GIS fallback:', error);
-    // If user configured or default client ID exists and Firebase popup failed due to domain, fallback to GIS
+    console.error('[Firebase Auth] signInWithPopup error:', error);
+
+    const fbCode: string = error?.code || '';
+    // Automatically fallback to signInWithRedirect if popup is blocked or unsupported in environment
     if (
-      error?.code === 'auth/unauthorized-domain' ||
-      error?.code === 'auth/operation-not-supported-in-this-environment'
+      fbCode === 'auth/operation-not-supported-in-this-environment' ||
+      fbCode === 'auth/popup-blocked' ||
+      fbCode === 'auth/invalid-action-code'
     ) {
-      const fallbackClientId = getEffectiveGoogleClientId();
-      if (fallbackClientId) {
-        return await signInWithGIS(fallbackClientId);
+      console.log(
+        `[Firebase Auth] Popup failed with ${fbCode}, falling back to signInWithRedirect...`
+      );
+      if (onBeforeRedirect) {
+        onBeforeRedirect();
+      }
+      setPendingRedirectMarker(true);
+      try {
+        await signInWithRedirect(auth, provider);
+        return null;
+      } catch (redirErr: any) {
+        setPendingRedirectMarker(false);
+        throw formatFirebaseAuthError(redirErr, 'signInWithRedirect (fallback)');
       }
     }
 
-    if (error?.code === 'auth/popup-closed-by-user') {
-      throw new DriveSyncError('Đã hủy đăng nhập Google.', 'UNKNOWN');
-    }
-
-    throw new DriveSyncError(
-      error?.message || 'Đăng nhập Google thất bại. Vui lòng thử lại.',
-      'UNKNOWN'
-    );
+    const formatted = formatFirebaseAuthError(error, 'signInWithPopup');
+    lastAuthDiagnosticLog = {
+      timestamp: new Date().toLocaleTimeString('vi-VN'),
+      flowUsed: 'popup',
+      authDomain: getEffectiveAuthDomain(),
+      currentOrigin: window.location.origin,
+      environment: envInfo.modeLabel,
+      redirectResultParams: null,
+      errorCode: fbCode || 'auth/unknown',
+      errorMessage: formatted.message,
+    };
+    throw formatted;
   } finally {
     isSigningIn = false;
   }
@@ -634,10 +1361,8 @@ export async function findDriveBackupFile(
             size: fileData.size ? Number(fileData.size) : undefined,
           };
         }
-        // If trashed, clear savedFileId and search by name
         setSavedDriveFileId(null);
       } else if (checkRes.status === 404) {
-        // File was deleted on Drive, clear savedFileId and search by name
         setSavedDriveFileId(null);
       } else {
         await handleDriveApiError(checkRes, 'kiểm tra file sao lưu');
@@ -722,12 +1447,10 @@ export async function uploadBackupToDrive(
     );
   }
 
-  // 1. Serialize full backup JSON (identical to local "Sao lưu (JSON)" format)
   const jsonString = serializeBackupJSON(expenses, advances, profiles);
   const jsonBlob = new Blob([jsonString], { type: 'application/json;charset=utf-8' });
   const sizeBytes = jsonBlob.size;
 
-  // 2. Resolve existing fileId so we ALWAYS update the same file instead of creating duplicates
   const existingFile = await findDriveBackupFile(token);
   const targetFileId = existingFile?.id || null;
 
@@ -735,11 +1458,9 @@ export async function uploadBackupToDrive(
   let uploadMethod: 'multipart' | 'resumable' = 'multipart';
 
   if (sizeBytes < RESUMABLE_UPLOAD_THRESHOLD_BYTES) {
-    // Multipart Upload for small/medium files
     uploadMethod = 'multipart';
     uploadedMeta = await performMultipartDriveUpload(token, jsonString, targetFileId);
   } else {
-    // Resumable Upload for large files (several MBs due to receipt images)
     uploadMethod = 'resumable';
     uploadedMeta = await performResumableDriveUpload(token, jsonBlob, targetFileId);
   }
@@ -747,7 +1468,6 @@ export async function uploadBackupToDrive(
   const finalFileId = uploadedMeta.id;
   const finalModifiedTime = uploadedMeta.modifiedTime || new Date().toISOString();
 
-  // Save fileId & sync timestamp for subsequent updates
   setSavedDriveFileId(finalFileId);
   const formattedSyncTime = saveDriveSyncTimestamp(finalModifiedTime);
   try {
@@ -852,7 +1572,6 @@ async function performResumableDriveUpload(
   const initMethod = existingFileId ? 'PATCH' : 'POST';
 
   try {
-    // Step 1: Initiate resumable upload session
     const initRes = await fetch(initUrl, {
       method: initMethod,
       headers: {
@@ -876,7 +1595,6 @@ async function performResumableDriveUpload(
       );
     }
 
-    // Step 2: Upload the JSON file content to the session URI
     const putRes = await fetch(uploadSessionUri, {
       method: 'PUT',
       headers: {
@@ -959,10 +1677,6 @@ export async function downloadBackupFromDrive(
     const rawText = await res.text();
     const validated = parseAndValidateBackupJSON(rawText);
 
-    if (validated.exportedAt && !specificFileId) {
-      // Keep Drive's modifiedTime as authoritative
-    }
-
     setSavedDriveFileId(meta.id);
 
     return {
@@ -989,7 +1703,6 @@ export function isDriveBackupNewerThanLocal(
   const driveTs = Date.parse(driveModifiedIso);
   if (Number.isNaN(driveTs)) return false;
 
-  // Reference timestamp on this device: whichever is newer between last sync and last local edit
   const syncTs = localLastSyncIso ? Date.parse(localLastSyncIso) : 0;
   const localEditTs = localLastModifiedIso ? Date.parse(localLastModifiedIso) : 0;
   const localRefTs = Math.max(
@@ -997,11 +1710,9 @@ export function isDriveBackupNewerThanLocal(
     Number.isNaN(localEditTs) ? 0 : localEditTs
   );
 
-  // If this device has never synced with Drive before, treat existing Drive backup as newer
   if (localRefTs === 0) {
     return true;
   }
 
-  // Allow 3-second tolerance for clock skew
   return driveTs - localRefTs > 3000;
 }

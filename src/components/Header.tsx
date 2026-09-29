@@ -9,18 +9,14 @@ import {
   BarChart3,
   Search,
   X,
-  AlertTriangle,
   MessageSquareText,
-  FileText,
   SlidersHorizontal,
   RotateCcw,
-  CheckCircle2,
   Calendar,
   DollarSign,
   Settings,
 } from 'lucide-react';
 import { formatVND } from '../utils/categories';
-import { PWAInstallButton } from './PWAInstallBanner';
 
 interface HeaderProps {
   currentTab: 'expenses' | 'dashboard';
@@ -31,7 +27,6 @@ interface HeaderProps {
   onOpenImportModal: () => void;
   onOpenExportModal: () => void;
   onOpenBulkModal: () => void;
-  onOpenPDFExport: () => void;
   onOpenSettings: () => void;
   searchTerm: string;
   setSearchTerm: (term: string) => void;
@@ -64,7 +59,6 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenImportModal,
   onOpenExportModal,
   onOpenBulkModal,
-  onOpenPDFExport,
   onOpenSettings,
   searchTerm,
   setSearchTerm,
@@ -92,80 +86,77 @@ export const Header: React.FC<HeaderProps> = ({
   return (
     <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200/90 shadow-2xs">
       <div className="max-w-6xl mx-auto px-3 sm:px-6 py-2.5">
-        {/* Top Branding & Main Actions Bar */}
-        <div className="flex items-center justify-between gap-2 sm:gap-4">
+        {/* Top Branding & Main Actions Bar - Balanced & Mobile-Safe */}
+        <div className="flex items-center justify-between gap-2">
           {/* Logo & Title */}
-          <div className="flex items-center gap-2.5 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 flex-1">
             <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-tr from-teal-800 to-teal-600 text-white flex items-center justify-center shadow-xs shrink-0">
-              <Wallet size={20} className="sm:size-22" />
+              <Wallet size={19} />
             </div>
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <h1 className="text-sm sm:text-base font-bold text-slate-900 truncate leading-tight tracking-tight">
                 Sổ Chi Tiêu &amp; Công Tác Phí
               </h1>
-              <p className="text-[11px] text-teal-700 font-semibold font-mono hidden xs:block">
+              <p className="text-[11px] text-teal-700 font-semibold font-mono truncate">
                 {formatVND(totalAmount)} · {totalExpensesCount} khoản
               </p>
             </div>
           </div>
 
-          {/* Action Buttons: PWA Install, Bulk Message, Import, PDF, Export, Add */}
-          <div className="flex items-center gap-1.5 sm:gap-2">
-            <PWAInstallButton />
-
+          {/* Action Buttons: Compact & Balanced on Mobile, Labeled on Desktop */}
+          <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
             <button
+              type="button"
               onClick={onOpenBulkModal}
               title="Dán tin nhắn tách nhiều khoản chi (Zalo)"
-              className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold text-teal-800 hover:text-teal-950 bg-teal-50/80 hover:bg-teal-100 rounded-xl border border-teal-200/70 transition-colors shrink-0 cursor-pointer"
+              aria-label="Tách tin nhắn"
+              className="h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold text-teal-800 hover:text-teal-950 bg-teal-50/80 hover:bg-teal-100 rounded-xl border border-teal-200/70 transition-colors shrink-0 cursor-pointer"
             >
-              <MessageSquareText size={15} />
-              <span className="hidden md:inline">Tách tin nhắn</span>
+              <MessageSquareText size={16} />
+              <span className="hidden lg:inline">Tách tin nhắn</span>
             </button>
 
             <button
+              type="button"
               onClick={onOpenImportModal}
               title="Nhập dữ liệu từ Excel (.xlsx)"
-              className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold text-slate-700 hover:text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl transition-colors shrink-0 cursor-pointer"
+              aria-label="Nhập Excel"
+              className="h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold text-slate-700 hover:text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl transition-colors shrink-0 cursor-pointer"
             >
-              <Upload size={15} />
-              <span className="hidden sm:inline">Nhập Excel</span>
-            </button>
-
-            {/* Requirement 9: Xuất PDF báo cáo kèm ảnh */}
-            <button
-              onClick={onOpenPDFExport}
-              title="Xuất báo cáo PDF kèm ảnh chứng từ thu nhỏ"
-              className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold text-rose-800 hover:text-rose-950 bg-rose-50 hover:bg-rose-100/90 rounded-xl border border-rose-200 transition-colors shrink-0 cursor-pointer"
-            >
-              <FileText size={15} className="text-rose-600" />
-              <span className="hidden sm:inline">Xuất PDF</span>
+              <Upload size={16} />
+              <span className="hidden md:inline">Nhập Excel</span>
             </button>
 
             <button
+              type="button"
               onClick={onOpenExportModal}
-              title="Xuất file Excel / Sao lưu JSON"
-              className="min-h-[44px] flex items-center gap-1.5 px-2.5 sm:px-3 py-2 text-xs font-semibold text-teal-800 hover:text-teal-900 bg-teal-50 hover:bg-teal-100/80 rounded-xl border border-teal-200/70 transition-colors shrink-0 cursor-pointer"
+              title="Xuất báo cáo (Excel / PDF) & Sao lưu dữ liệu"
+              aria-label="Xuất báo cáo"
+              className="h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold text-teal-800 hover:text-teal-950 bg-teal-50 hover:bg-teal-100/80 rounded-xl border border-teal-200/70 transition-colors shrink-0 cursor-pointer"
             >
-              <FileSpreadsheet size={15} />
-              <span className="hidden sm:inline">Xuất / Sao lưu</span>
+              <FileSpreadsheet size={16} />
+              <span className="hidden sm:inline">Xuất báo cáo</span>
             </button>
 
             <button
+              type="button"
               onClick={onOpenSettings}
-              title="Cài đặt khóa Gemini API & Hệ thống"
-              aria-label="Cài đặt khóa Gemini API"
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center p-2 text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl transition-colors shrink-0 cursor-pointer"
+              title="Cài đặt, Đồng bộ Google Drive, Xuất PDF & Hệ thống"
+              aria-label="Cài đặt"
+              className="h-9 w-9 sm:h-10 sm:w-10 flex items-center justify-center text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200/80 rounded-xl transition-colors shrink-0 cursor-pointer"
             >
-              <Settings size={18} />
+              <Settings size={17} />
             </button>
 
             <button
+              type="button"
               onClick={onOpenAddModal}
               title="Thêm khoản chi mới"
-              className="min-h-[44px] flex items-center gap-1.5 px-3.5 sm:px-4 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 active:bg-teal-900 rounded-xl shadow-xs transition-colors shrink-0 cursor-pointer"
+              aria-label="Thêm khoản chi mới"
+              className="h-9 sm:h-10 flex items-center justify-center gap-1 px-2.5 sm:px-3.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 active:bg-teal-900 rounded-xl shadow-xs transition-colors shrink-0 cursor-pointer"
             >
               <Plus size={16} />
-              <span>Thêm mới</span>
+              <span className="hidden xs:inline sm:inline">Thêm mới</span>
             </button>
           </div>
         </div>
@@ -175,6 +166,7 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Main Navigation: Sổ chi tiêu vs Thống kê */}
           <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-xl">
             <button
+              type="button"
               onClick={() => setCurrentTab('expenses')}
               className={`flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
                 currentTab === 'expenses'
@@ -186,6 +178,7 @@ export const Header: React.FC<HeaderProps> = ({
               <span>Sổ chi tiêu</span>
             </button>
             <button
+              type="button"
               onClick={() => setCurrentTab('dashboard')}
               className={`flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
                 currentTab === 'dashboard'
@@ -203,6 +196,7 @@ export const Header: React.FC<HeaderProps> = ({
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1 p-0.5 bg-slate-100 rounded-xl">
                 <button
+                  type="button"
                   onClick={() => setViewMode('table')}
                   title="Xem dạng bảng tính gốc"
                   className={`p-1.5 rounded-lg text-xs transition-all cursor-pointer ${
@@ -214,6 +208,7 @@ export const Header: React.FC<HeaderProps> = ({
                   <TableIcon size={15} />
                 </button>
                 <button
+                  type="button"
                   onClick={() => setViewMode('card')}
                   title="Xem dạng thẻ điện thoại"
                   className={`p-1.5 rounded-lg text-xs transition-all cursor-pointer ${
@@ -234,7 +229,7 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="mt-2 space-y-2">
             <div className="flex flex-wrap items-center gap-2">
               {/* Search Input: Từ khóa trong diễn giải */}
-              <div className="relative flex-1 min-w-[150px]">
+              <div className="relative flex-1 min-w-[140px]">
                 <Search
                   size={14}
                   className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400"
@@ -248,6 +243,7 @@ export const Header: React.FC<HeaderProps> = ({
                 />
                 {searchTerm && (
                   <button
+                    type="button"
                     onClick={() => setSearchTerm('')}
                     aria-label="Xóa tìm kiếm"
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5"
@@ -412,4 +408,3 @@ export const Header: React.FC<HeaderProps> = ({
     </header>
   );
 };
-

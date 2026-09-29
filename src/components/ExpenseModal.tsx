@@ -16,6 +16,7 @@ import { ExpenseItem, DescriptionSuggestion } from '../types';
 import { formatVND } from '../utils/categories';
 import { compressImage, scanReceiptWithAI, parseNaturalExpense } from '../utils/gemini';
 import { buildDescriptionSuggestions, findDuplicateExpenses } from '../utils/db';
+import { saveExpenseModalDraft, loadExpenseModalDraft } from '../utils/googleDrive';
 
 interface ExpenseModalProps {
   isOpen: boolean;
@@ -63,13 +64,36 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
   } | null>(null);
 
   useEffect(() => {
-    if (editingItem) {
+    if (!isOpen) return;
+
+    const savedDraft = loadExpenseModalDraft();
+    const targetEditId = editingItem ? editingItem.id : null;
+
+    if (
+      savedDraft &&
+      savedDraft.editingItemId === targetEditId &&
+      Date.now() - (savedDraft.updatedAt || 0) < 30 * 60 * 1000 &&
+      (savedDraft.description.trim() ||
+        savedDraft.amount !== '' ||
+        savedDraft.notes.trim() ||
+        savedDraft.images.length > 0 ||
+        savedDraft.naturalText.trim())
+    ) {
+      setDescription(savedDraft.description);
+      setAmount(savedDraft.amount);
+      setMonth(savedDraft.month || defaultMonth);
+      setDate(savedDraft.date);
+      setNotes(savedDraft.notes);
+      setImages(savedDraft.images || []);
+      setNaturalText(savedDraft.naturalText || '');
+    } else if (editingItem) {
       setDescription(editingItem.description);
       setAmount(editingItem.amount);
       setMonth(editingItem.month || defaultMonth);
       setDate(editingItem.date);
       setNotes(editingItem.notes || '');
       setImages(editingItem.images || []);
+      setNaturalText('');
     } else {
       setDescription('');
       setAmount('');
@@ -81,14 +105,39 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
       setDate(`${dd}/${mm}/${yyyy}`);
       setNotes('');
       setImages([]);
+      setNaturalText('');
     }
     setScanMessage(null);
     setNaturalMessage(null);
-    setNaturalText('');
     setPendingDuplicateItem(null);
     setMatchedDuplicates([]);
     setShowSuggestions(false);
   }, [editingItem, defaultMonth, isOpen]);
+
+  // Persist draft while modal is open so redirect sign-in never loses unsaved input
+  useEffect(() => {
+    if (!isOpen) return;
+    const hasContent =
+      description.trim().length > 0 ||
+      amount !== '' ||
+      notes.trim().length > 0 ||
+      images.length > 0 ||
+      naturalText.trim().length > 0;
+
+    if (hasContent) {
+      saveExpenseModalDraft({
+        editingItemId: editingItem ? editingItem.id : null,
+        description,
+        amount,
+        month,
+        date,
+        notes,
+        images,
+        naturalText,
+        updatedAt: Date.now(),
+      });
+    }
+  }, [isOpen, editingItem, description, amount, month, date, notes, images, naturalText]);
 
   // Compute historical description suggestions (Requirement 5)
   const suggestions = useMemo<DescriptionSuggestion[]>(() => {
@@ -317,15 +366,22 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
       return;
     }
 
+    saveExpenseModalDraft(null);
     onSave(candidate);
     onClose();
   };
 
   const handleForceSaveDuplicate = () => {
     if (!pendingDuplicateItem) return;
+    saveExpenseModalDraft(null);
     onSave(pendingDuplicateItem);
     setPendingDuplicateItem(null);
     setMatchedDuplicates([]);
+    onClose();
+  };
+
+  const handleDiscardAndClose = () => {
+    saveExpenseModalDraft(null);
     onClose();
   };
 
@@ -350,7 +406,7 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
             </p>
           </div>
           <button
-            onClick={onClose}
+            onClick={handleDiscardAndClose}
             aria-label="Đóng"
             className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-200/60 transition-colors cursor-pointer"
           >

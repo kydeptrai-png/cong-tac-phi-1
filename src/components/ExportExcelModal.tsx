@@ -45,6 +45,7 @@ interface ExportExcelModalProps {
   onToggleAutoBackup?: (enabled: boolean) => void;
   lastBackupTime?: string | null;
   onDownloadBackupNow?: () => void;
+  onOpenPDFExportModal?: () => void;
 }
 
 interface PendingBackupState extends ValidatedBackupResult {
@@ -65,6 +66,7 @@ export const ExportExcelModal: React.FC<ExportExcelModalProps> = ({
   onToggleAutoBackup,
   lastBackupTime,
   onDownloadBackupNow,
+  onOpenPDFExportModal,
 }) => {
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
   const [reportTitle, setReportTitle] = useState('Bao_Cao_Cong_Tac_Phi');
@@ -861,9 +863,23 @@ export const ExportExcelModal: React.FC<ExportExcelModalProps> = ({
                 title="Mỗi khoản chi 1 dòng kèm ảnh chứng từ thu nhỏ bên dưới, nhóm theo tháng"
               >
                 <Printer size={15} className="text-rose-600" />
-                <span>Xuất PDF báo cáo kèm ảnh</span>
+                <span>Xuất PDF nhanh kèm ảnh</span>
               </button>
             </div>
+
+            {onOpenPDFExportModal && (
+              <button
+                type="button"
+                onClick={() => {
+                  onClose();
+                  onOpenPDFExportModal();
+                }}
+                className="w-full py-2.5 px-3 text-xs font-semibold text-rose-900 bg-white hover:bg-rose-50 rounded-xl border border-rose-200 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Printer size={14} className="text-rose-600" />
+                <span>Tùy chỉnh xuất PDF nâng cao (Chọn cột, khổ A4 dọc/ngang, người lập...)</span>
+              </button>
+            )}
           </div>
         </div>
 
