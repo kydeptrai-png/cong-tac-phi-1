@@ -1,8 +1,9 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getAuth,
   signInWithPopup,
   signInWithRedirect,
+  signInWithCredential,
   getRedirectResult,
   GoogleAuthProvider,
   onAuthStateChanged,
@@ -10,6 +11,9 @@ import {
   setPersistence,
   User,
 } from 'firebase/auth';
+import { Capacitor } from '@capacitor/core';
+import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
+import { GoogleAuth } from '@codetrix-studio/capacitor-google-auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
   ExpenseItem,
@@ -224,9 +228,11 @@ export function setPreferredAuthFlowMode(mode: AuthFlowPreference): void {
 
 export function shouldUseRedirectFlow(): boolean {
   const pref = getPreferredAuthFlowMode();
+  // Never force web redirect in Capacitor native APK (uses native Capacitor Google plugin instead)
+  if (Capacitor.isNativePlatform()) return false;
   if (pref === 'redirect') return true;
   if (pref === 'popup') return false;
-  return detectStandaloneEnvironment().isStandalone;
+  return false;
 }
 
 // Initialize Firebase App & Auth with verified authDomain
@@ -235,7 +241,7 @@ const resolvedFirebaseConfig = {
   authDomain: getEffectiveAuthDomain(),
 };
 
-const app = initializeApp(resolvedFirebaseConfig);
+const app = getApps().length > 0 ? getApp() : initializeApp(resolvedFirebaseConfig);
 const auth = getAuth(app);
 
 // Ensure persistence is browserLocalPersistence so redirect state is preserved across navigation
@@ -840,7 +846,23 @@ export async function signInWithGIS(
           }
 
           cachedAccessToken = token;
-          const driveUser = await fetchDriveUserInfo(token);
+          let driveUser = await fetchDriveUserInfo(token);
+          try {
+            // Also sign into Firebase Auth using the Google OAuth access token so Firestore real-time sync has request.auth.uid
+            const fbCred = GoogleAuthProvider.credential(null, token);
+            const fbRes = await signInWithCredential(auth, fbCred);
+            if (fbRes?.user) {
+              driveUser = {
+                uid: fbRes.user.uid,
+                displayName: fbRes.user.displayName || driveUser.displayName,
+                email: fbRes.user.email || driveUser.email,
+                photoURL: fbRes.user.photoURL || driveUser.photoURL,
+                authMethod: 'firebase',
+              };
+            }
+          } catch (fbCredErr) {
+            console.warn('[GIS Auth] signInWithCredential fallback note:', fbCredErr);
+          }
           cachedUserInfo = driveUser;
           isSigningIn = false;
           resolve({ user: driveUser, accessToken: token });
@@ -1109,13 +1131,95 @@ export const initAuth = (
 };
 
 /**
+ * Requirement 7: Sign in with Google on Capacitor Android APK using native Capacitor plugins
+ * (`@capacitor-firebase/authentication` or `@codetrix-studio/capacitor-google-auth`)
+ * instead of Firebase Web SDK popup/redirect which fails with "The requested action is invalid" in WebView.
+ */
+export async function signInWithCapacitorNativeGoogle(): Promise<{
+  user: GoogleDriveUser;
+  accessToken: string;
+}> {
+  let idToken: string | null = null;
+  let accessToken: string | null = null;
+  let profileName: string | null = null;
+  let profileEmail: string | null = null;
+  let profilePhoto: string | null = null;
+
+  // 1. Try @capacitor-firebase/authentication first
+  try {
+    const fbNativeRes = await FirebaseAuthentication.signInWithGoogle({
+      scopes: ['email', 'profile', ...SCOPES],
+      useCredentialManager: false,
+    });
+    idToken = fbNativeRes?.credential?.idToken || null;
+    accessToken = fbNativeRes?.credential?.accessToken || null;
+    profileName = fbNativeRes?.user?.displayName || null;
+    profileEmail = fbNativeRes?.user?.email || null;
+    profilePhoto = fbNativeRes?.user?.photoUrl || null;
+  } catch (capFbErr: any) {
+    console.warn(
+      '[Capacitor Auth] @capacitor-firebase/authentication fallback to @codetrix-studio/capacitor-google-auth:',
+      capFbErr
+    );
+  }
+
+  // 2. Fallback to @codetrix-studio/capacitor-google-auth if idToken/accessToken not yet obtained
+  if (!idToken && !accessToken) {
+    try {
+      const clientId = getEffectiveGoogleClientId();
+      await GoogleAuth.initialize({
+        clientId: clientId || undefined,
+        scopes: ['profile', 'email', ...SCOPES],
+        grantOfflineAccess: false,
+      });
+    } catch {
+      // ignore if already initialized
+    }
+
+    const googleUser = await GoogleAuth.signIn();
+    idToken = googleUser?.authentication?.idToken || null;
+    accessToken = googleUser?.authentication?.accessToken || null;
+    profileName = googleUser?.name || googleUser?.givenName || null;
+    profileEmail = googleUser?.email || null;
+    profilePhoto = googleUser?.imageUrl || null;
+  }
+
+  if (!idToken && !accessToken) {
+    throw new DriveSyncError(
+      'Không lấy được thông tin xác thực từ plugin đăng nhập Google gốc trên thiết bị.',
+      'FIREBASE_AUTH_ERROR'
+    );
+  }
+
+  // Authenticate Firebase JS SDK in WebView using signInWithCredential (no redirect/popup to firebaseapp.com!)
+  const credential = GoogleAuthProvider.credential(idToken, accessToken || undefined);
+  const userCred = await signInWithCredential(auth, credential);
+
+  const effectiveToken = accessToken || '';
+  if (effectiveToken) {
+    cachedAccessToken = effectiveToken;
+  }
+
+  const mappedUser: GoogleDriveUser = {
+    uid: userCred.user.uid,
+    displayName: userCred.user.displayName || profileName || 'Người dùng Google',
+    email: userCred.user.email || profileEmail,
+    photoURL: userCred.user.photoURL || profilePhoto,
+    authMethod: 'firebase',
+  };
+  cachedUserInfo = mappedUser;
+
+  return {
+    user: mappedUser,
+    accessToken: effectiveToken,
+  };
+}
+
+/**
  * Sign in with Google:
- * 1. If user pasted a custom Google Client ID in Settings -> uses GIS TokenClient.
- * 2. If running in Standalone / TWA / Capacitor (`shouldUseRedirectFlow() === true`) ->
- *    saves app context & unsaved drafts, then calls `signInWithRedirect(auth, provider)`.
- * 3. Otherwise on standard web -> uses `signInWithPopup(auth, provider)`, and if popup fails
- *    or is unsupported (`auth/operation-not-supported-in-this-environment`, `auth/popup-blocked`, `auth/invalid-action-code`),
- *    automatically switches to `signInWithRedirect(auth, provider)`.
+ * 1. If running in Capacitor Native APK -> uses native Capacitor plugin (`@capacitor-firebase/authentication` or `@codetrix-studio/capacitor-google-auth`) + `signInWithCredential`.
+ * 2. If user pasted a custom Google Client ID in Settings -> uses GIS TokenClient + `signInWithCredential`.
+ * 3. Otherwise on Web -> uses `signInWithPopup(auth, provider)`.
  */
 export const googleSignIn = async (
   onBeforeRedirect?: () => void
@@ -1125,17 +1229,46 @@ export const googleSignIn = async (
 } | null> => {
   if (typeof navigator !== 'undefined' && !navigator.onLine) {
     throw new DriveSyncError(
-      'Thiết bị đang ngoại tuyến. Vui lòng kết nối Internet để đăng nhập Google Drive.',
+      'Thiết bị đang ngoại tuyến. Vui lòng kết nối Internet để đăng nhập Google.',
       'OFFLINE'
     );
+  }
+
+  const envInfo = detectStandaloneEnvironment();
+
+  // Requirement 7: Use native Capacitor Google Sign-In plugin in packaged APK
+  if (Capacitor.isNativePlatform() || envInfo.details.isCapacitor) {
+    try {
+      isSigningIn = true;
+      return await signInWithCapacitorNativeGoogle();
+    } catch (capErr: any) {
+      console.warn('[Capacitor Auth] Native plugin error, checking fallback:', capErr);
+      // If user explicitly canceled, surface clean message
+      const msg = String(capErr?.message || capErr || '');
+      if (msg.toLowerCase().includes('cancel') || msg.includes('12501')) {
+        isSigningIn = false;
+        throw new DriveSyncError('Đã hủy đăng nhập Google.', 'UNKNOWN');
+      }
+      // If a custom Google Client ID is available, fallback to GIS instead of broken firebaseapp.com redirect
+      const clientId = getEffectiveGoogleClientId();
+      if (clientId) {
+        return await signInWithGIS(clientId);
+      }
+      isSigningIn = false;
+      throw new DriveSyncError(
+        capErr?.message ||
+          'Lỗi đăng nhập Google trong APK. Hãy kiểm tra SHA-1 / google-services.json hoặc nhập Google Client ID trong Cài đặt.',
+        'FIREBASE_AUTH_ERROR'
+      );
+    } finally {
+      isSigningIn = false;
+    }
   }
 
   const customClientId = getUserGoogleClientId();
   if (customClientId) {
     return await signInWithGIS(customClientId);
   }
-
-  const envInfo = detectStandaloneEnvironment();
   const useRedirect = shouldUseRedirectFlow();
 
   if (useRedirect) {
@@ -1251,6 +1384,10 @@ export const getAccessToken = async (): Promise<string | null> => {
   return cachedAccessToken;
 };
 
+export const getSavedAccessToken = (): string | null => {
+  return cachedAccessToken;
+};
+
 export const getCurrentDriveUser = (): GoogleDriveUser | null => {
   return cachedUserInfo;
 };
@@ -1261,6 +1398,10 @@ export const logoutGoogleDrive = async (): Promise<void> => {
     cachedAccessToken = null;
     cachedUserInfo = null;
     await auth.signOut();
+    if (Capacitor.isNativePlatform()) {
+      await FirebaseAuthentication.signOut().catch(() => {});
+      await GoogleAuth.signOut().catch(() => {});
+    }
     if (tokenToRevoke && (window as any).google?.accounts?.oauth2?.revoke) {
       (window as any).google.accounts.oauth2.revoke(tokenToRevoke, () => {});
     }
@@ -1270,6 +1411,83 @@ export const logoutGoogleDrive = async (): Promise<void> => {
     cachedUserInfo = null;
   }
 };
+
+/**
+ * Requirement 4: Upload a single receipt image (base64 data URL) to Google Drive
+ * and return its viewable URL so Firestore only stores the URL instead of raw base64.
+ */
+export async function uploadReceiptDataUrlToDrive(
+  dataUrl: string,
+  fileName: string,
+  explicitToken?: string
+): Promise<string | null> {
+  const token = explicitToken || cachedAccessToken;
+  if (!token || !dataUrl.startsWith('data:')) return null;
+
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+  if (!match) return null;
+
+  const mimeType = match[1] || 'image/jpeg';
+  const base64Data = match[2];
+
+  const boundary = '-------CongTacPhiReceiptImg' + Date.now().toString(16);
+  const delimiter = `\r\n--${boundary}\r\n`;
+  const closeDelimiter = `\r\n--${boundary}--`;
+
+  const metadata = {
+    name: fileName,
+    mimeType,
+    description: 'Ảnh hóa đơn chứng từ Sổ Chi Tiêu & Công Tác Phí',
+  };
+
+  const multipartBody =
+    delimiter +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify(metadata) +
+    delimiter +
+    `Content-Type: ${mimeType}\r\n` +
+    'Content-Transfer-Encoding: base64\r\n\r\n' +
+    base64Data +
+    closeDelimiter;
+
+  const res = await fetch(
+    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webContentLink,thumbnailLink',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': `multipart/related; boundary=${boundary}`,
+      },
+      body: multipartBody,
+    }
+  );
+
+  if (!res.ok) return null;
+  const data = await res.json();
+  if (!data?.id) return null;
+
+  // Best-effort: make receipt image viewable via link so other devices of the user can render <img src> directly
+  try {
+    await fetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(data.id)}/permissions`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          role: 'reader',
+          type: 'anyone',
+        }),
+      }
+    );
+  } catch {
+    // ignore permission warning
+  }
+
+  return `https://drive.google.com/uc?export=view&id=${data.id}`;
+}
 
 /**
  * Helper to handle Drive API HTTP errors and map them to clear Vietnamese explanations

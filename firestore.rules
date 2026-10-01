@@ -1,0 +1,178 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserBackupMeta(data) {
+      return data.keys().hasAll(['ownerId', 'driveFileId', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'driveFileId', 'updatedAt']) &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId == request.auth.uid &&
+        data.driveFileId is string &&
+        data.driveFileId.size() >= 1 &&
+        data.driveFileId.size() <= 128 &&
+        data.updatedAt == request.time;
+    }
+
+    function isValidUserDoc(data) {
+      return data.keys().hasAll(['ownerId', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'displayName', 'updatedAt']) &&
+        data.ownerId is string &&
+        data.ownerId.size() >= 1 &&
+        data.ownerId.size() <= 128 &&
+        data.ownerId == request.auth.uid &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 200)) &&
+        (data.updatedAt is timestamp || data.updatedAt is number);
+    }
+
+    function isValidUrlList(listVal) {
+      return listVal is list &&
+        listVal.size() <= 30 &&
+        (listVal.size() == 0 || (listVal[0] is string && listVal[0].size() <= 2048));
+    }
+
+    function isValidExpenseDoc(data, expenseId) {
+      return data.keys().hasAll([
+          'id',
+          'month',
+          'date',
+          'amount',
+          'description',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'day',
+          'monthNum',
+          'year',
+          'date',
+          'month',
+          'amount',
+          'description',
+          'comment',
+          'notes',
+          'imageUrls',
+          'images',
+          'sheetName',
+          'profileId',
+          'createdAt',
+          'updatedAt',
+          'updatedAtMs'
+        ]) &&
+        data.id is string &&
+        data.id.size() >= 1 &&
+        data.id.size() <= 128 &&
+        data.id == expenseId &&
+        (!('ownerId' in data) || (data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId == request.auth.uid)) &&
+        (!('day' in data) || (data.day is number && data.day >= 1 && data.day <= 31)) &&
+        (!('monthNum' in data) || (data.monthNum is number && data.monthNum >= 1 && data.monthNum <= 12)) &&
+        (!('year' in data) || (data.year is number && data.year >= 1970 && data.year <= 2200)) &&
+        data.date is string &&
+        data.date.size() >= 1 &&
+        data.date.size() <= 64 &&
+        data.month is string &&
+        data.month.size() >= 1 &&
+        data.month.size() <= 64 &&
+        data.amount is number &&
+        data.description is string &&
+        data.description.size() >= 1 &&
+        data.description.size() <= 2000 &&
+        (data.createdAt is number || data.createdAt is timestamp) &&
+        (data.updatedAt is timestamp || data.updatedAt is number) &&
+        (!('updatedAtMs' in data) || data.updatedAtMs is number) &&
+        (!('comment' in data) || (data.comment is string && data.comment.size() <= 2000)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 2000)) &&
+        (!('sheetName' in data) || (data.sheetName is string && data.sheetName.size() <= 128)) &&
+        (!('profileId' in data) || (data.profileId is string && data.profileId.size() >= 1 && data.profileId.size() <= 128)) &&
+        (!('imageUrls' in data) || isValidUrlList(data.imageUrls)) &&
+        (!('images' in data) || isValidUrlList(data.images));
+    }
+
+    match /userBackups/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUserBackupMeta(incoming());
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserBackupMeta(incoming()) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['driveFileId', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(userId);
+    }
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) && isValidId(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUserDoc(incoming());
+      allow update: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserDoc(incoming()) &&
+        (!('ownerId' in existing()) || incoming().ownerId == existing().ownerId) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['ownerId', 'displayName', 'updatedAt']);
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      match /expenses/{expenseId} {
+        allow get: if isOwner(userId) && isValidId(userId) && isValidId(expenseId);
+        allow list: if isOwner(userId);
+        allow create: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(expenseId) &&
+          isValidExpenseDoc(incoming(), expenseId);
+        allow update: if isOwner(userId) &&
+          isValidId(userId) &&
+          isValidId(expenseId) &&
+          isValidExpenseDoc(incoming(), expenseId) &&
+          (!('id' in existing()) || incoming().id == existing().id) &&
+          (!('ownerId' in existing()) || incoming().ownerId == existing().ownerId) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'id',
+            'ownerId',
+            'day',
+            'monthNum',
+            'year',
+            'date',
+            'month',
+            'amount',
+            'description',
+            'comment',
+            'notes',
+            'imageUrls',
+            'images',
+            'sheetName',
+            'profileId',
+            'createdAt',
+            'updatedAt',
+            'updatedAtMs'
+          ]);
+        allow delete: if isOwner(userId) && isValidId(userId) && isValidId(expenseId);
+      }
+    }
+  }
+}

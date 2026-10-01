@@ -10,6 +10,7 @@ import {
   Search,
   X,
   MessageSquareText,
+  ClipboardPaste,
   SlidersHorizontal,
   RotateCcw,
   Calendar,
@@ -25,6 +26,7 @@ interface HeaderProps {
   setViewMode: (mode: 'table' | 'card') => void;
   onOpenAddModal: () => void;
   onOpenImportModal: () => void;
+  onOpenPasteExcelModal?: () => void;
   onOpenExportModal: () => void;
   onOpenBulkModal: () => void;
   onOpenSettings: () => void;
@@ -57,6 +59,7 @@ export const Header: React.FC<HeaderProps> = ({
   setViewMode,
   onOpenAddModal,
   onOpenImportModal,
+  onOpenPasteExcelModal,
   onOpenExportModal,
   onOpenBulkModal,
   onOpenSettings,
@@ -105,6 +108,19 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Action Buttons: Compact & Balanced on Mobile, Labeled on Desktop */}
           <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+            {onOpenPasteExcelModal && (
+              <button
+                type="button"
+                onClick={onOpenPasteExcelModal}
+                title="Dán nhanh các dòng hoặc ảnh chụp bảng từ Excel (Ctrl+V)"
+                aria-label="Dán từ Excel"
+                className="h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold text-emerald-800 hover:text-emerald-950 bg-emerald-50 hover:bg-emerald-100 rounded-xl border border-emerald-200/80 transition-colors shrink-0 cursor-pointer"
+              >
+                <ClipboardPaste size={16} />
+                <span className="hidden lg:inline">Dán từ Excel</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={onOpenBulkModal}
@@ -113,7 +129,7 @@ export const Header: React.FC<HeaderProps> = ({
               className="h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold text-teal-800 hover:text-teal-950 bg-teal-50/80 hover:bg-teal-100 rounded-xl border border-teal-200/70 transition-colors shrink-0 cursor-pointer"
             >
               <MessageSquareText size={16} />
-              <span className="hidden lg:inline">Tách tin nhắn</span>
+              <span className="hidden xl:inline">Tách tin nhắn</span>
             </button>
 
             <button

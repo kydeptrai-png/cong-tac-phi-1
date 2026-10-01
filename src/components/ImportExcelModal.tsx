@@ -15,6 +15,8 @@ import {
   Trash2,
   CornerDownRight,
   RotateCcw,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { ExpenseItem } from '../types';
 import {
@@ -62,27 +64,39 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
   const [previewItems, setPreviewItems] = useState<PreviewExpenseItem[]>([]);
   const [parseResultMeta, setParseResultMeta] = useState<ExcelImportResult | null>(null);
 
-  // Bộ lọc trên bảng xem trước
-  const [previewFilter, setPreviewFilter] = useState<'all' | 'warnings' | 'refunds' | 'comments'>('all');
+  // Bộ lọc trên bảng xem trước (thêm tab 'duplicates': Trùng lặp (N))
+  const [previewFilter, setPreviewFilter] = useState<
+    'all' | 'warnings' | 'duplicates' | 'refunds' | 'comments'
+  >('all');
   const [selectedSheetFilter, setSelectedSheetFilter] = useState<string>('all');
 
   const [importMode, setImportMode] = useState<'append' | 'replace'>('append');
+  // Lựa chọn tổng cho các dòng trùng CÒN LẠI chưa được xử lý riêng
   const [duplicateHandling, setDuplicateHandling] = useState<'keep' | 'skip'>('keep');
+  // Lựa chọn riêng cho từng dòng trùng: id -> 'keep' ("Vẫn thêm dòng này") | 'skip' ("Bỏ qua dòng này")
+  const [rowDuplicateDecisions, setRowDuplicateDecisions] = useState<
+    Record<string, 'keep' | 'skip'>
+  >({});
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Requirement 3: Detect duplicates against existingExpenses when in 'append' mode
-  const existingKeysSet = useMemo(() => {
-    const set = new Set<string>();
+  // Map từ duplicateKey -> khoản chi đã tồn tại trong hệ thống để biết chính xác trùng với khoản NÀO
+  const existingExpensesMap = useMemo(() => {
+    const map = new Map<string, ExpenseItem>();
     existingExpenses.forEach((e) => {
-      set.add(buildDuplicateKey(e.date, e.amount, e.description));
+      const key = buildDuplicateKey(e.date, e.amount, e.description);
+      if (!map.has(key)) {
+        map.set(key, e);
+      }
     });
-    return set;
+    return map;
   }, [existingExpenses]);
 
-  const duplicatePreviewIds = useMemo(() => {
-    const dupSet = new Set<string>();
-    const seenInPreview = new Set<string>();
+  // Map các dòng trong file mới đang trùng Ngày + Số tiền + Diễn giải với khoản đã có trong hệ thống
+  const duplicateMatchesMap = useMemo(() => {
+    const matchMap = new Map<string, ExpenseItem>();
+    if (importMode !== 'append') return matchMap;
+
     for (const it of previewItems) {
       const validDay = it.day !== null && it.day >= 1 && it.day <= 31 ? it.day : 1;
       const validMonth =
@@ -90,13 +104,53 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
       const cleanDate = formatDayMonthYear(validDay, validMonth, it.year);
       const key = buildDuplicateKey(cleanDate, it.amount, it.description);
 
-      if ((importMode === 'append' && existingKeysSet.has(key)) || seenInPreview.has(key)) {
-        dupSet.add(it.id);
+      const matchedExisting = existingExpensesMap.get(key);
+      if (matchedExisting) {
+        matchMap.set(it.id, matchedExisting);
       }
-      seenInPreview.add(key);
     }
-    return dupSet;
-  }, [previewItems, existingKeysSet, importMode]);
+    return matchMap;
+  }, [previewItems, existingExpensesMap, importMode]);
+
+  // Danh sách ID các dòng trùng CHƯA được người dùng xử lý riêng (số N trên tab "Trùng lặp (N)" & banner dưới)
+  const unresolvedDuplicateIds = useMemo(() => {
+    const ids: string[] = [];
+    duplicateMatchesMap.forEach((_, id) => {
+      if (!rowDuplicateDecisions[id]) {
+        ids.push(id);
+      }
+    });
+    return ids;
+  }, [duplicateMatchesMap, rowDuplicateDecisions]);
+
+  // Thống kê số dòng trùng đã xử lý riêng và tổng số dòng sẽ thực sự được nhập
+  const duplicateResolutionStats = useMemo(() => {
+    let totalDuplicates = duplicateMatchesMap.size;
+    let resolvedKeepCount = 0;
+    let resolvedSkipCount = 0;
+    let unresolvedCount = 0;
+
+    duplicateMatchesMap.forEach((_, id) => {
+      const decision = rowDuplicateDecisions[id];
+      if (decision === 'keep') resolvedKeepCount++;
+      else if (decision === 'skip') resolvedSkipCount++;
+      else unresolvedCount++;
+    });
+
+    const totalSkipped =
+      resolvedSkipCount + (duplicateHandling === 'skip' ? unresolvedCount : 0);
+    const finalImportCount = Math.max(0, previewItems.length - totalSkipped);
+
+    return {
+      totalDuplicates,
+      resolvedKeepCount,
+      resolvedSkipCount,
+      resolvedTotal: resolvedKeepCount + resolvedSkipCount,
+      unresolvedCount,
+      totalSkipped,
+      finalImportCount,
+    };
+  }, [duplicateMatchesMap, rowDuplicateDecisions, duplicateHandling, previewItems.length]);
 
   // Thống kê nhanh trên danh sách previewItems hiện tại
   const stats = useMemo(() => {
@@ -131,6 +185,9 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
       if (previewFilter === 'warnings') {
         return item.warnings && item.warnings.length > 0;
       }
+      if (previewFilter === 'duplicates') {
+        return duplicateMatchesMap.has(item.id);
+      }
       if (previewFilter === 'refunds') {
         return item.amount < 0;
       }
@@ -139,7 +196,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
       }
       return true;
     });
-  }, [previewItems, previewFilter, selectedSheetFilter]);
+  }, [previewItems, previewFilter, selectedSheetFilter, duplicateMatchesMap]);
 
   const activeSheetObj = useMemo(() => {
     if (!rawWorkbook) return null;
@@ -194,6 +251,8 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
       setActiveSheetTab(wb.sheets[0].sheetName);
       setSelectedSheetFilter('all');
       setPreviewFilter('all');
+      setRowDuplicateDecisions({});
+      setDuplicateHandling('keep');
 
       const result = buildImportPreview(wb, {
         startYear,
@@ -400,16 +459,36 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
   };
 
   const handleDeletePreviewItem = (id: string) => {
+    setRowDuplicateDecisions((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     setPreviewItems((prev) => revalidatePreviewItems(prev.filter((it) => it.id !== id)));
+  };
+
+  // Xử lý từng dòng trùng riêng lẻ ("Vẫn thêm dòng này" / "Bỏ qua dòng này")
+  const handleSetRowDuplicateDecision = (id: string, decision: 'keep' | 'skip') => {
+    setRowDuplicateDecisions((prev) => ({
+      ...prev,
+      [id]: decision,
+    }));
   };
 
   const handleConfirmImport = () => {
     if (previewItems.length === 0) return;
 
-    const sourceItems =
-      duplicateHandling === 'skip' && duplicatePreviewIds.size > 0
-        ? previewItems.filter((it) => !duplicatePreviewIds.has(it.id))
-        : previewItems;
+    // Lọc các khoản chi sẽ nhập:
+    // - Nếu dòng trùng đã được người dùng chọn riêng ('keep' hoặc 'skip') -> tôn trọng tuyệt đối lựa chọn riêng đó
+    // - Nếu dòng trùng CHƯA được xử lý riêng -> áp dụng lựa chọn tổng (duplicateHandling) ở banner dưới cùng
+    const sourceItems = previewItems.filter((it) => {
+      if (!duplicateMatchesMap.has(it.id)) return true;
+      const individualDecision = rowDuplicateDecisions[it.id];
+      if (individualDecision === 'keep') return true;
+      if (individualDecision === 'skip') return false;
+      return duplicateHandling !== 'skip';
+    });
 
     // Chuẩn hóa sang ExpenseItem trước khi lưu vào DB
     const finalItems: ExpenseItem[] = sourceItems.map((it) => {
@@ -467,7 +546,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                 Nhập Dữ Liệu Từ Excel (.xlsx / .xls)
               </h3>
               <p className="text-[11px] sm:text-xs text-slate-500">
-                Tự suy ra Tháng (t1..t12), điền Ngày tự động (forward-fill), giữ comment &amp; kiểm tra dòng đáng ngờ
+                Nhận diện mốc tháng (t4/2026, t1..t12, 9.2025, Tháng 9), điền ngày tự động (forward-fill) &amp; cảnh báo ngày giảm bất thường
               </p>
             </div>
           </div>
@@ -519,7 +598,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                     </div>
                   </div>
                   <p className="text-[11px] text-slate-500 leading-relaxed">
-                    Nếu mốc tháng giảm so với mốc trước (VD: từ <strong>t12</strong> sang <strong>t1</strong>), hệ thống tự tăng năm lên <strong>+1</strong>.
+                    Dùng khi mốc tháng đầu tiên không ghi năm (VD: <strong>t1</strong>, <strong>Tháng 9</strong>). Các mốc không ghi năm tiếp theo sẽ giữ nguyên năm của mốc liền trước.
                   </p>
                 </div>
 
@@ -625,10 +704,10 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                 </div>
                 <ul className="list-disc list-inside space-y-1 text-slate-500 text-[11px] pl-1">
                   <li>
-                    <strong>Mốc tháng (t1..t12, T 3, Tháng 3):</strong> Hiểu là dòng tiêu đề tháng. Khi tháng giảm (VD: t12 → t1) tự tăng năm +1.
+                    <strong>Mốc tháng (t4/2026, t1..t12, 9.2025, Tháng 9/2025):</strong> Khi ô cột Ngày khớp định dạng mốc tháng và ô Số tiền cùng dòng trống, hiểu là dòng mốc tháng (nếu không ghi năm thì giữ nguyên năm của mốc liền trước).
                   </li>
                   <li>
-                    <strong>Điền ngày tự động (Forward-fill):</strong> Dòng để trống ô Ngày sẽ lấy cùng ngày với khoản chi gần nhất phía trên trong cùng tháng. Reset khi sang tháng mới.
+                    <strong>Điền ngày tự động (Forward-fill):</strong> Ô Ngày trống sẽ kế thừa ngày của dòng gần nhất phía trên cùng tháng/năm (kể cả khi lặp lại nhiều dòng liên tiếp). Khi ngày giảm mà không có mốc tháng xen giữa, giữ nguyên tháng hiện tại và gắn icon cảnh báo để kiểm tra tay.
                   </li>
                   <li>
                     <strong>Tự nhận diện vị trí cột:</strong> Tự tìm cột Ngày, Số tiền, Diễn giải cho từng sheet và cho phép chỉnh lại.
@@ -960,7 +1039,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                   <button
                     type="button"
                     onClick={() => setPreviewFilter('warnings')}
-                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors ${
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer ${
                       previewFilter === 'warnings'
                         ? 'bg-amber-600 text-white'
                         : stats.warningCount > 0
@@ -970,6 +1049,22 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                   >
                     <AlertTriangle size={12} />
                     <span>Đáng ngờ ({stats.warningCount})</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPreviewFilter('duplicates')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer ${
+                      previewFilter === 'duplicates'
+                        ? 'bg-rose-600 text-white shadow-2xs'
+                        : duplicateResolutionStats.unresolvedCount > 0
+                        ? 'bg-rose-100 text-rose-900 border border-rose-300 hover:bg-rose-200'
+                        : duplicateResolutionStats.totalDuplicates > 0
+                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200 hover:bg-emerald-100'
+                        : 'bg-slate-100 text-slate-400'
+                    }`}
+                  >
+                    <Copy size={12} />
+                    <span>Trùng lặp ({duplicateResolutionStats.unresolvedCount})</span>
                   </button>
                   {stats.refundCount > 0 && (
                     <button
@@ -1042,21 +1137,48 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                           const hasWarning = item.warnings && item.warnings.length > 0;
                           const isDayDecreased = item.warningTypes?.includes('day_decreased');
                           const isRefund = item.amount < 0;
+                          const matchedDuplicate = duplicateMatchesMap.get(item.id);
+                          const isDuplicate = Boolean(matchedDuplicate);
+                          const rowDecision = rowDuplicateDecisions[item.id]; // 'keep' | 'skip' | undefined
+
+                          // Dấu hiệu trực quan khi dòng trùng đã được người dùng xử lý (chọn thêm hoặc bỏ qua)
+                          const rowBgClass =
+                            isDuplicate && rowDecision === 'keep'
+                              ? 'bg-emerald-50/50 hover:bg-emerald-50/80'
+                              : isDuplicate && rowDecision === 'skip'
+                              ? 'bg-slate-100/80 opacity-65 hover:opacity-90'
+                              : isDuplicate
+                              ? 'bg-rose-50/40 hover:bg-rose-50/70'
+                              : hasWarning
+                              ? 'bg-amber-50/70 hover:bg-amber-100/60'
+                              : isRefund
+                              ? 'bg-cyan-50/30 hover:bg-cyan-50/60'
+                              : 'hover:bg-slate-50';
 
                           return (
                             <React.Fragment key={item.id}>
-                              <tr
-                                className={`transition-colors ${
-                                  hasWarning
-                                    ? 'bg-amber-50/70 hover:bg-amber-100/60'
-                                    : isRefund
-                                    ? 'bg-cyan-50/30 hover:bg-cyan-50/60'
-                                    : 'hover:bg-slate-50'
-                                }`}
-                              >
-                                {/* Dòng Excel & Sheet */}
+                              <tr className={`transition-colors ${rowBgClass}`}>
+                                {/* Dòng Excel & Sheet + Icon Check nếu đã xử lý trùng */}
                                 <td className="py-2 px-2.5 text-center font-mono text-[11px] text-slate-400">
-                                  <div>#{item.rowIndex}</div>
+                                  <div className="flex items-center justify-center gap-1">
+                                    <span>#{item.rowIndex}</span>
+                                    {isDuplicate && rowDecision && (
+                                      <span
+                                        title={
+                                          rowDecision === 'keep'
+                                            ? 'Đã xử lý: Vẫn thêm dòng này'
+                                            : 'Đã xử lý: Bỏ qua dòng này'
+                                        }
+                                        className={`inline-flex items-center justify-center w-4 h-4 rounded-full ${
+                                          rowDecision === 'keep'
+                                            ? 'bg-emerald-600 text-white'
+                                            : 'bg-slate-500 text-white'
+                                        }`}
+                                      >
+                                        <Check size={10} />
+                                      </span>
+                                    )}
+                                  </div>
                                   {rawWorkbook.sheets.length > 1 && (
                                     <div className="text-[9px] text-slate-400 truncate max-w-[48px]">
                                       {item.sheetName}
@@ -1107,7 +1229,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                                   </div>
                                 </td>
 
-                                {/* Cột Ngày (Sửa trực tiếp + hiển thị DD/MM/YYYY) */}
+                                {/* Cột Ngày (Sửa trực tiếp + icon cảnh báo nhỏ + hiển thị DD/MM/YYYY) */}
                                 <td className="py-2 px-2.5 align-top">
                                   <div className="flex items-center gap-1.5">
                                     <input
@@ -1127,6 +1249,14 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                                           : 'border-slate-200 bg-white text-slate-800'
                                       }`}
                                     />
+                                    {hasWarning && (
+                                      <span
+                                        title={item.warnings.join(' • ')}
+                                        className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-100 text-amber-700 shrink-0 cursor-help"
+                                      >
+                                        <AlertTriangle size={12} />
+                                      </span>
+                                    )}
                                     {item.isDateCellEmpty && (
                                       <span
                                         title="Ngày được điền tự động (forward-fill) từ dòng trên"
@@ -1252,6 +1382,103 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                                   </td>
                                 </tr>
                               )}
+
+                              {/* Dòng phụ cảnh báo Trùng lặp + 2 nút xử lý riêng từng dòng (Yêu cầu 2, 3, 6) */}
+                              {isDuplicate && matchedDuplicate && (
+                                <tr
+                                  className={`border-b transition-colors ${
+                                    rowDecision === 'keep'
+                                      ? 'bg-emerald-50/90 border-emerald-200'
+                                      : rowDecision === 'skip'
+                                      ? 'bg-slate-100 border-slate-200'
+                                      : 'bg-rose-50/90 border-rose-200'
+                                  }`}
+                                >
+                                  <td />
+                                  <td colSpan={5} className="py-1.5 px-2.5">
+                                    <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                                      <div
+                                        className={`flex items-center gap-1.5 font-medium ${
+                                          rowDecision === 'keep'
+                                            ? 'text-emerald-900'
+                                            : rowDecision === 'skip'
+                                            ? 'text-slate-600 line-through'
+                                            : 'text-rose-900'
+                                        }`}
+                                      >
+                                        {rowDecision ? (
+                                          <CheckCircle2
+                                            size={13}
+                                            className={
+                                              rowDecision === 'keep'
+                                                ? 'text-emerald-600 shrink-0'
+                                                : 'text-slate-500 shrink-0'
+                                            }
+                                          />
+                                        ) : (
+                                          <Copy size={13} className="text-rose-600 shrink-0" />
+                                        )}
+                                        <span>
+                                          Trùng với khoản đã có:{' '}
+                                          <strong className="font-mono">
+                                            {matchedDuplicate.date}
+                                          </strong>{' '}
+                                          -{' '}
+                                          <strong className="font-mono">
+                                            {formatVND(matchedDuplicate.amount)}
+                                          </strong>{' '}
+                                          - <strong>{matchedDuplicate.description}</strong>
+                                        </span>
+                                        {rowDecision && (
+                                          <span
+                                            className={`ml-1 px-1.5 py-0.5 rounded text-[10px] font-bold no-underline inline-flex items-center gap-1 ${
+                                              rowDecision === 'keep'
+                                                ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                                : 'bg-slate-200 text-slate-700 border border-slate-300'
+                                            }`}
+                                          >
+                                            <Check size={10} />
+                                            {rowDecision === 'keep'
+                                              ? 'Đã chọn: Vẫn thêm'
+                                              : 'Đã chọn: Bỏ qua'}
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      <div className="flex items-center gap-1.5 shrink-0">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            handleSetRowDuplicateDecision(item.id, 'keep')
+                                          }
+                                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold text-[11px] border transition-colors cursor-pointer ${
+                                            rowDecision === 'keep'
+                                              ? 'bg-emerald-700 text-white border-emerald-800 shadow-2xs'
+                                              : 'bg-white text-emerald-800 border-emerald-300 hover:bg-emerald-50'
+                                          }`}
+                                        >
+                                          {rowDecision === 'keep' && <Check size={11} />}
+                                          <span>Vẫn thêm dòng này</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            handleSetRowDuplicateDecision(item.id, 'skip')
+                                          }
+                                          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg font-semibold text-[11px] border transition-colors cursor-pointer ${
+                                            rowDecision === 'skip'
+                                              ? 'bg-slate-700 text-white border-slate-800 shadow-2xs'
+                                              : 'bg-white text-rose-800 border-rose-300 hover:bg-rose-50'
+                                          }`}
+                                        >
+                                          {rowDecision === 'skip' && <Check size={11} />}
+                                          <span>Bỏ qua dòng này</span>
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
                             </React.Fragment>
                           );
                         })
@@ -1266,16 +1493,26 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
 
         {/* Footer */}
         <div className="flex flex-col gap-2 px-5 py-3.5 bg-slate-50 border-t border-slate-100">
-          {/* Requirement 3: Duplicate Warning Banner in Excel Import */}
-          {rawWorkbook && duplicatePreviewIds.size > 0 && (
+          {/* Requirement 3 & 4: Duplicate Warning Banner in Excel Import (chỉ áp dụng cho các dòng CÒN LẠI chưa xử lý riêng) */}
+          {rawWorkbook && duplicateResolutionStats.totalDuplicates > 0 && (
             <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 text-xs flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <AlertTriangle size={15} className="text-amber-600 shrink-0" />
                 <span>
-                  <strong>Cảnh báo trùng:</strong> Có <strong>{duplicatePreviewIds.size}</strong> dòng trong file trùng Ngày, Số tiền và Diễn giải với khoản đã có.
+                  <strong>Cảnh báo trùng:</strong> Phát hiện{' '}
+                  <strong>{duplicateResolutionStats.totalDuplicates}</strong> dòng trùng Ngày + Số tiền + Diễn giải với khoản đã có
+                  {duplicateResolutionStats.resolvedTotal > 0 ? (
+                    <span>
+                      {' '}
+                      (đã xử lý riêng <strong>{duplicateResolutionStats.resolvedTotal}</strong> dòng, còn{' '}
+                      <strong>{duplicateResolutionStats.unresolvedCount}</strong> dòng chưa xử lý).
+                    </span>
+                  ) : (
+                    <span>.</span>
+                  )}
                 </span>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 flex-wrap">
                 <button
                   type="button"
                   onClick={() => setDuplicateHandling('keep')}
@@ -1285,7 +1522,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                       : 'bg-white text-amber-900 border-amber-300 hover:bg-amber-100/50'
                   }`}
                 >
-                  Vẫn thêm tất cả ({previewItems.length})
+                  Vẫn thêm tất cả ({duplicateResolutionStats.unresolvedCount})
                 </button>
                 <button
                   type="button"
@@ -1296,7 +1533,10 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                       : 'bg-white text-teal-900 border-teal-300 hover:bg-teal-50'
                   }`}
                 >
-                  Bỏ qua khoản trùng (Chỉ nhập {previewItems.length - duplicatePreviewIds.size} khoản)
+                  Bỏ qua khoản trùng
+                  {duplicateResolutionStats.unresolvedCount > 0
+                    ? ` (${duplicateResolutionStats.unresolvedCount} dòng chưa xử lý)`
+                    : ''}
                 </button>
               </div>
             </div>
@@ -1313,6 +1553,11 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                   {stats.warningCount > 0 && (
                     <span className="ml-2 text-amber-700 font-semibold">
                       ({stats.warningCount} dòng cảnh báo)
+                    </span>
+                  )}
+                  {duplicateResolutionStats.totalDuplicates > 0 && (
+                    <span className="ml-2 text-rose-700 font-semibold">
+                      ({duplicateResolutionStats.unresolvedCount} dòng trùng chưa xử lý)
                     </span>
                   )}
                 </span>
@@ -1334,11 +1579,7 @@ export const ImportExcelModal: React.FC<ImportExcelModalProps> = ({
                   className="px-5 py-2.5 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 active:bg-teal-900 rounded-xl shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
                 >
                   <span>
-                    Xác nhận nhập{' '}
-                    {duplicateHandling === 'skip'
-                      ? previewItems.length - duplicatePreviewIds.size
-                      : previewItems.length}{' '}
-                    khoản chi
+                    Xác nhận nhập {duplicateResolutionStats.finalImportCount} khoản chi
                   </span>
                   <ArrowRight size={14} />
                 </button>

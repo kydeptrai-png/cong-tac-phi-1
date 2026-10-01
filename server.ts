@@ -1,6 +1,8 @@
-import express, { Request, Response } from 'express';
+import express from 'express';
+import type { Request, Response } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -393,6 +395,139 @@ Quy tắc:
   }
 });
 
+// API: Parse Pasted Excel Table Image using Gemini Vision
+app.post('/api/parse-excel-image', async (req: Request, res: Response) => {
+  try {
+    const {
+      imageBase64,
+      mimeType = 'image/png',
+      defaultMonthNum,
+      defaultYear,
+      unitMode = 'thousand',
+    } = req.body;
+
+    if (!imageBase64) {
+      return res.status(400).json({
+        success: false,
+        error: 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+      });
+    }
+
+    const apiKey = getEffectiveApiKey(req);
+    if (!apiKey) {
+      return res.status(401).json({
+        success: false,
+        error: 'Chưa cấu hình khóa Gemini API. Bạn có thể vào Cài đặt để thêm khóa API của riêng bạn.',
+      });
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const cleanBase64 = String(imageBase64).replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+    const fallbackMonth = Number(defaultMonthNum) >= 1 && Number(defaultMonthNum) <= 12
+      ? Number(defaultMonthNum)
+      : new Date().getMonth() + 1;
+    const fallbackYear = Number(defaultYear) >= 2000 && Number(defaultYear) <= 2100
+      ? Number(defaultYear)
+      : new Date().getFullYear();
+
+    const promptText = `
+Bạn là chuyên gia kế toán đọc dữ liệu bảng tính Excel được chụp hoặc copy-paste dưới dạng HÌNH ẢNH.
+Hãy đọc hình ảnh này như một bảng dữ liệu các khoản chi tiêu (thường gồm các cột: Ngày, Số tiền, Diễn giải/Nội dung) và trích xuất từng dòng khoản chi nhìn thấy trong ảnh.
+
+Quy tắc đọc bảng bắt buộc:
+1. Mốc tháng ("t1", "t2", ..., "t12", "T 3", "Tháng 3", "Tháng 4/2026"):
+   - Nếu có dòng ghi mốc tháng (ví dụ "t3", "T4", "Tháng 3") thì các dòng bên dưới thuộc tháng đó.
+   - Nếu mốc tháng giảm (ví dụ từ t12 sang t1) thì năm tăng thêm 1.
+   - Nếu trong ảnh KHÔNG có dòng mốc tháng nào, sử dụng tháng mặc định là Tháng ${String(fallbackMonth).padStart(2, '0')}/${fallbackYear}.
+2. Cột Ngày (Forward-fill):
+   - Ô ngày thường ghi số ngày từ 1 đến 31 (hoặc DD/MM, DD/MM/YYYY).
+   - Nếu một dòng có ô Ngày ĐỂ TRỐNG, hãy lấy theo Ngày của dòng gần nhất phía trên nó (forward-fill).
+   - Nếu những dòng đầu tiên chưa có ngày nào phía trên, dùng ngày "01".
+   - Kết quả trường "ngay" luôn định dạng chuẩn "DD/MM/YYYY" (ví dụ: "17/03/${fallbackYear}").
+3. Cột Số tiền ("so_tien"):
+   - Đọc chính xác con số (giữ nguyên dấu âm nếu là khoản hoàn/trừ như -158, -200).
+   - Chế độ đơn vị tiền hiện tại: "${unitMode === 'vnd' ? 'Đồng VNĐ (giữ nguyên số)' : 'Nghìn đồng (nhân 1.000 nếu số nhỏ dưới 100.000, ví dụ 116 -> 116000, -158 -> -158000; nếu số đã ghi đầy đủ như 116.000 hoặc 116,000 thì là 116000)'}".
+   - Trả về "so_tien" là số nguyên VNĐ.
+4. Cột Diễn giải ("dien_giai"):
+   - Nội dung chi tiêu của dòng đó (kèm ghi chú nếu có).
+5. Bỏ qua các dòng tiêu đề cột ("STT", "Ngày", "Số tiền", "Diễn giải") và bỏ qua các dòng "Tổng", "Tổng cộng", "Cộng".
+6. Nếu bức ảnh hoàn toàn KHÔNG phải là bảng dữ liệu hay danh sách chi tiêu (ví dụ ảnh phong cảnh, ảnh trống không có chữ/số), hãy trả về mảng rỗng [].
+`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              data: cleanBase64,
+              mimeType: mimeType || 'image/png',
+            },
+          },
+          {
+            text: promptText,
+          },
+        ],
+      },
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.ARRAY,
+          description: 'Danh sách các dòng khoản chi đọc được từ ảnh bảng Excel',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              ngay: {
+                type: Type.STRING,
+                description: 'Ngày phát sinh định dạng DD/MM/YYYY',
+              },
+              so_tien: {
+                type: Type.NUMBER,
+                description: 'Số tiền bằng VNĐ (đã quy đổi theo đơn vị)',
+              },
+              dien_giai: {
+                type: Type.STRING,
+                description: 'Nội dung diễn giải của dòng chi tiêu',
+              },
+            },
+            required: ['ngay', 'so_tien', 'dien_giai'],
+          },
+        },
+      },
+    });
+
+    const outputText = response.text?.trim() || '[]';
+    let parsedList: any[] = [];
+    try {
+      const parsed = JSON.parse(outputText);
+      if (Array.isArray(parsed)) {
+        parsedList = parsed;
+      }
+    } catch {
+      parsedList = [];
+    }
+
+    return res.json({
+      success: true,
+      data: parsedList,
+    });
+  } catch (error: any) {
+    console.error('Parse excel image error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error?.message || 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+    });
+  }
+});
+
 // API: Summarize Expenses in Natural Vietnamese using Gemini
 app.post('/api/summarize-expenses', async (req: Request, res: Response) => {
   try {
@@ -449,12 +584,50 @@ ${JSON.stringify(summaryPayload, null, 2)}
   }
 });
 
-// Static files from public folder (fonts, icons, manifest, sw)
+// In-memory font cache for PDF export without storing binary .ttf files in source tree
+const fontBufferCache: Record<string, Buffer> = {};
+const FONT_CDN_URLS: Record<string, string> = {
+  'Roboto-Regular.ttf': 'https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Regular.ttf',
+  'Roboto-Bold.ttf': 'https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Medium.ttf',
+};
+
+app.get('/fonts/:fontName', async (req: Request, res: Response) => {
+  const fontName = String(req.params.fontName || '');
+  const cdnUrl = FONT_CDN_URLS[fontName];
+  if (!cdnUrl) {
+    return res.status(404).send('Font not found');
+  }
+  try {
+    if (!fontBufferCache[fontName]) {
+      const response = await fetch(cdnUrl);
+      if (!response.ok) {
+        return res.status(502).send('Failed to fetch font from upstream');
+      }
+      const arrayBuf = await response.arrayBuffer();
+      fontBufferCache[fontName] = Buffer.from(arrayBuf);
+    }
+    res.setHeader('Content-Type', 'font/ttf');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    return res.send(fontBufferCache[fontName]);
+  } catch (err) {
+    console.error('Error serving font:', err);
+    return res.status(500).send('Font proxy error');
+  }
+});
+
+// Static files from public folder (icons, manifest, sw)
 app.use(express.static(path.resolve(__dirname, 'public')));
 
 // Setup Vite in Dev or static files in Production
 async function startServer() {
-  const isProduction = process.env.NODE_ENV === 'production';
+  const isDevScript = process.env.npm_lifecycle_event === 'dev';
+  const distPath = path.resolve(__dirname, 'dist');
+  const distIndex = path.resolve(distPath, 'index.html');
+
+  const isProduction =
+    !isDevScript &&
+    (process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start') &&
+    fs.existsSync(distIndex);
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
@@ -468,10 +641,9 @@ async function startServer() {
 
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
+      res.sendFile(distIndex);
     });
   }
 

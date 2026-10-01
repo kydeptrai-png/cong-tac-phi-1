@@ -8,12 +8,15 @@ import {
   AlertCircle,
   AlertTriangle,
   MessageSquareText,
+  ClipboardPaste,
 } from 'lucide-react';
 import { NaturalExpenseParsed, ExpenseItem } from '../types';
 import { formatVND } from '../utils/categories';
 import { parseNaturalExpense } from '../utils/gemini';
+import { isClipboardTableLike } from '../utils/excel';
 import { findDuplicateExpenses } from '../utils/db';
 import { saveNaturalInputDraft, loadNaturalInputDraft } from '../utils/googleDrive';
+import { InitialClipboardPayload } from './PasteExcelModal';
 
 interface NaturalExpenseInputProps {
   onAddExpense: (item: ExpenseItem) => void;
@@ -21,6 +24,7 @@ interface NaturalExpenseInputProps {
   existingExpenses?: ExpenseItem[];
   activeProfileId?: string;
   onOpenBulkMessageModal?: () => void;
+  onOpenPasteExcelModal?: (initialPayload?: InitialClipboardPayload) => void;
 }
 
 export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
@@ -29,6 +33,7 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
   existingExpenses = [],
   activeProfileId = 'default',
   onOpenBulkMessageModal,
+  onOpenPasteExcelModal,
 }) => {
   const [inputText, setInputText] = useState('');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -207,6 +212,55 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
     setIsEditingPreview(false);
   };
 
+  // Requirement 1: Catch paste event directly in the main input screen
+  const handleInputPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    if (!onOpenPasteExcelModal) return;
+    const clipboardData = e.clipboardData;
+    if (!clipboardData) return;
+
+    // 1. Check if clipboard contains an image (e.g. copied Excel range as image)
+    if (clipboardData.items) {
+      for (let i = 0; i < clipboardData.items.length; i++) {
+        const item = clipboardData.items[i];
+        if (item.type.startsWith('image/')) {
+          const blob = item.getAsFile();
+          if (blob) {
+            e.preventDefault();
+            onOpenPasteExcelModal({
+              id: `clip_img_${Date.now()}`,
+              imageBlob: blob,
+            });
+            return;
+          }
+        }
+      }
+    }
+
+    if (clipboardData.files && clipboardData.files.length > 0) {
+      const f = clipboardData.files[0];
+      if (f.type.startsWith('image/')) {
+        e.preventDefault();
+        onOpenPasteExcelModal({
+          id: `clip_file_${Date.now()}`,
+          imageBlob: f,
+        });
+        return;
+      }
+    }
+
+    // 2. Check if clipboard contains Excel tabular data (HTML table or Tab-separated columns)
+    const htmlText = clipboardData.getData('text/html') || '';
+    const plainText = clipboardData.getData('text/plain') || '';
+    if (isClipboardTableLike(plainText, htmlText)) {
+      e.preventDefault();
+      onOpenPasteExcelModal({
+        id: `clip_tbl_${Date.now()}`,
+        plainText,
+        htmlText,
+      });
+    }
+  };
+
   return (
     <div className="bg-white rounded-2xl p-4 sm:p-5 border border-slate-200/90 shadow-xs mb-5 transition-all">
       {/* Top Banner / Title */}
@@ -217,18 +271,18 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
           </div>
           <div>
             <h3 className="text-xs sm:text-sm font-bold text-slate-900 flex items-center gap-1.5">
-              <span>Nhập nhanh bằng câu văn bản tự nhiên</span>
+              <span>Nhập nhanh bằng câu tự nhiên hoặc Dán trực tiếp từ Excel</span>
               <span className="text-[10px] bg-teal-100 text-teal-800 px-1.5 py-0.5 rounded-full font-semibold border border-teal-200/70">
                 AI Gemini
               </span>
             </h3>
             <p className="text-[11px] text-slate-500">
-              Gõ 1 câu tự nhiên hoặc dán đoạn tin nhắn dài (Zalo) để AI tự động tách khoản chi
+              Gõ 1 câu tự nhiên, bấm <strong>Ctrl+V</strong> dán bảng/ảnh từ Excel, hoặc dán tin nhắn Zalo
             </p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
           {/* Quick Example Badges */}
           <div className="hidden xl:flex items-center gap-1.5 text-[11px] text-slate-400">
             <span>Ví dụ:</span>
@@ -246,6 +300,19 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
               </button>
             ))}
           </div>
+
+          {/* Button: Dán từ Excel */}
+          {onOpenPasteExcelModal && (
+            <button
+              type="button"
+              onClick={() => onOpenPasteExcelModal()}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold transition-colors cursor-pointer shadow-2xs"
+              title="Dán nhanh các dòng vừa copy từ Excel (hỗ trợ cả dạng bảng chữ và hình ảnh)"
+            >
+              <ClipboardPaste size={14} className="text-emerald-700" />
+              <span>Dán từ Excel</span>
+            </button>
+          )}
 
           {/* Requirement 6: Button to open Bulk Multi-line Message Parser */}
           {onOpenBulkMessageModal && (
@@ -268,13 +335,14 @@ export const NaturalExpenseInput: React.FC<NaturalExpenseInputProps> = ({
           <input
             type="text"
             value={inputText}
+            onPaste={handleInputPaste}
             onChange={(e) => {
               setInputText(e.target.value);
               if (errorMessage) setErrorMessage(null);
             }}
             onKeyDown={handleKeyDown}
             disabled={isAnalyzing}
-            placeholder='VD: "mua phở hết 150k", "đi chợ mua rau 35 nghìn hôm qua", "thuốc ho 1tr2"...'
+            placeholder='Gõ câu tự nhiên (VD: "mua phở 150k") hoặc bấm Ctrl+V dán vùng ô/ảnh vừa copy từ Excel...'
             className="w-full pl-3.5 pr-20 py-2.5 sm:py-3 text-xs sm:text-sm rounded-xl border border-slate-300 bg-slate-50/50 hover:bg-white focus:bg-white text-slate-900 placeholder:text-slate-400 focus:outline-hidden focus:ring-2 focus:ring-teal-600/30 focus:border-teal-600 transition-all shadow-2xs"
           />
           {inputText && !isAnalyzing && (

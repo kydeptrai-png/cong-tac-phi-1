@@ -74,56 +74,70 @@ export interface ExcelImportResult {
 }
 
 /**
- * Rule 1: Check if a cell matches a month header format:
- * "t1", "t2", ..., "t12" (case-insensitive, allows whitespace like "T 3", "t.3", "t03", or "Tháng 3", "thang 3")
+ * Regex nhận diện dòng mốc tháng:
+ * - "t" + số + "/" + năm        → ví dụ: t4/2026, t12/2025
+ * - "t" + số (không năm)        → ví dụ: t1, t2, t3
+ * - số tháng + "." + năm         → ví dụ: 9.2025, 10.2025, 11.2025
+ * - "Tháng" + số (có thể có năm) → ví dụ: Tháng 9, Tháng 9/2025
  */
-export function matchMonthHeader(text: string): {
+export const MONTH_MARKER_REGEX = /^(t|tháng|thang)?\s*(\d{1,2})\s*([./]\s*(\d{4}))?$/i;
+
+/**
+ * Rule 1 & Rule 2:
+ * Kiểm tra cell ở cột "ngày" (kết hợp kiểm tra cell ở cột "số tiền" cùng dòng nếu truyền vào):
+ * 1. Nếu cell ở cột "ngày" match MONTH_MARKER_REGEX VÀ cell ở cột "số tiền" cùng dòng
+ *    đang TRỐNG (không có giá trị) → đây là dòng mốc tháng, không phải khoản chi.
+ *    Lấy nhóm số đầu (\d{1,2}) làm "tháng" (1..12), nhóm năm (\d{4}, nếu có) làm "năm".
+ * 2. Nếu KHÔNG match các dạng trên, hoặc cell "số tiền" cùng dòng CÓ giá trị
+ *    → đây vẫn là 1 khoản chi bình thường, không phải mốc tháng.
+ */
+export function matchMonthHeader(
+  text: string | number | null | undefined,
+  amountCellValue?: string | number | null
+): {
   isMonth: boolean;
   monthNum?: number;
   explicitYear?: number;
   monthLabel?: string;
+  hasPrefixOrYear?: boolean;
 } {
-  if (!text || typeof text !== 'string') return { isMonth: false };
-  const clean = text.trim();
+  // Rule 2: Nếu cell "số tiền" cùng dòng CÓ giá trị -> không phải mốc tháng
+  if (
+    amountCellValue !== undefined &&
+    amountCellValue !== null &&
+    String(amountCellValue).trim() !== ''
+  ) {
+    return { isMonth: false };
+  }
+
+  if (text === null || text === undefined) return { isMonth: false };
+  const clean = String(text).trim();
   if (!clean) return { isMonth: false };
 
-  // Pattern 1: "t1".."t12", "T 3", "t.03", "T3/2025", "t-12"
-  const tPattern = /^t\.?\s*0?([1-9]|1[0-2])(?:\s*[\/\-]\s*(20\d{2}|\d{2}))?[:.]?$/i;
-  const tMatch = clean.match(tPattern);
-  if (tMatch) {
-    const num = parseInt(tMatch[1], 10);
-    let explicitYear: number | undefined;
-    if (tMatch[2]) {
-      const y = parseInt(tMatch[2], 10);
-      explicitYear = y < 100 ? 2000 + y : y;
-    }
-    return {
-      isMonth: true,
-      monthNum: num,
-      explicitYear,
-      monthLabel: explicitYear ? `Tháng ${num}/${explicitYear}` : `Tháng ${num}`,
-    };
+  const match = clean.match(MONTH_MARKER_REGEX);
+  if (!match) return { isMonth: false };
+
+  const num = parseInt(match[2], 10);
+  if (isNaN(num) || num < 1 || num > 12) {
+    return { isMonth: false };
   }
 
-  // Pattern 2: "thang 3", "tháng 03", "Tháng 3/2026"
-  const thangPattern = /^(?:th[aá]ng)\s*0?([1-9]|1[0-2])(?:\s*[\/\-]\s*(20\d{2}|\d{2}))?[:.]?$/i;
-  const thangMatch = clean.match(thangPattern);
-  if (thangMatch) {
-    const num = parseInt(thangMatch[1], 10);
-    let explicitYear: number | undefined;
-    if (thangMatch[2]) {
-      const y = parseInt(thangMatch[2], 10);
-      explicitYear = y < 100 ? 2000 + y : y;
-    }
-    return {
-      isMonth: true,
-      monthNum: num,
-      explicitYear,
-      monthLabel: explicitYear ? `Tháng ${num}/${explicitYear}` : `Tháng ${num}`,
-    };
+  const explicitYear = match[4] ? parseInt(match[4], 10) : undefined;
+  const hasPrefixOrYear = Boolean(match[1] || match[4]);
+
+  // Nếu không truyền amountCellValue (kiểm tra chuỗi đơn lẻ), yêu cầu phải có tiền tố (t/tháng) hoặc hậu tố năm (.YYYY / /YYYY)
+  // để tránh nhầm số ngày/số tiền đơn lẻ "10" là mốc tháng khi gọi độc lập
+  if (amountCellValue === undefined && !hasPrefixOrYear) {
+    return { isMonth: false };
   }
 
-  return { isMonth: false };
+  return {
+    isMonth: true,
+    monthNum: num,
+    explicitYear,
+    monthLabel: explicitYear ? `Tháng ${num}/${explicitYear}` : `Tháng ${num}`,
+    hasPrefixOrYear,
+  };
 }
 
 /**
@@ -138,8 +152,9 @@ export function parseRawNumber(val: any): number | null {
   const str = String(val).trim();
   if (!str) return null;
 
-  // Do not treat month headers like "t1", "T 3", "Tháng 3" as numbers
-  if (matchMonthHeader(str).isMonth) return null;
+  // Do not treat explicit month headers like "t1", "t4/2026", "9.2025", "Tháng 9" as numbers
+  const mHeader = matchMonthHeader(str);
+  if (mHeader.isMonth && mHeader.hasPrefixOrYear) return null;
 
   // Reject strings that contain letters (except trailing 'k', 'đ', 'vnd', 'd')
   const strippedCurrency = str.replace(/(?:vn[đd]|[đd]|k)\s*$/i, '').trim();
@@ -207,6 +222,8 @@ export function parseAmount(val: any, unitMode: AmountUnitMode = 'thousand'): nu
 export function parseDayFromCell(cell: RawCell | undefined): {
   isEmpty: boolean;
   day: number | null;
+  explicitMonth?: number;
+  explicitYear?: number;
   isInvalid: boolean;
 } {
   if (!cell || (cell.value === '' && cell.text === '')) {
@@ -223,7 +240,13 @@ export function parseDayFromCell(cell: RawCell | undefined): {
       try {
         const dObj = XLSX.SSF.parse_date_code(cell.value);
         if (dObj && dObj.d >= 1 && dObj.d <= 31) {
-          return { isEmpty: false, day: dObj.d, isInvalid: false };
+          return {
+            isEmpty: false,
+            day: dObj.d,
+            explicitMonth: dObj.m >= 1 && dObj.m <= 12 ? dObj.m : undefined,
+            explicitYear: dObj.y >= 1990 && dObj.y <= 2100 ? dObj.y : undefined,
+            isInvalid: false,
+          };
         }
       } catch {
         // ignore
@@ -250,8 +273,34 @@ export function parseDayFromCell(cell: RawCell | undefined): {
   const dmMatch = s.match(/^(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?$/);
   if (dmMatch) {
     const d = parseInt(dmMatch[1], 10);
-    if (d >= 1 && d <= 31) {
-      return { isEmpty: false, day: d, isInvalid: false };
+    const m = parseInt(dmMatch[2], 10);
+    let y = dmMatch[3] ? parseInt(dmMatch[3], 10) : undefined;
+    if (y !== undefined && y < 100) y += 2000;
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12) {
+      return {
+        isEmpty: false,
+        day: d,
+        explicitMonth: m,
+        explicitYear: y,
+        isInvalid: false,
+      };
+    }
+  }
+
+  // ISO Date string like "2026-03-17"
+  const ymdMatch = s.match(/^(20\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (ymdMatch) {
+    const y = parseInt(ymdMatch[1], 10);
+    const m = parseInt(ymdMatch[2], 10);
+    const d = parseInt(ymdMatch[3], 10);
+    if (d >= 1 && d <= 31 && m >= 1 && m <= 12) {
+      return {
+        isEmpty: false,
+        day: d,
+        explicitMonth: m,
+        explicitYear: y,
+        isInvalid: false,
+      };
     }
   }
 
@@ -395,13 +444,6 @@ export function detectSheetColumns(
     const c = nonEmptyColIndices[0];
     return { dateColIdx: c, amountColIdx: c + 1, descColIdx: c + 2 };
   }
-  if (nonEmptyColIndices.length === 2) {
-    return {
-      dateColIdx: nonEmptyColIndices[0],
-      amountColIdx: nonEmptyColIndices[0],
-      descColIdx: nonEmptyColIndices[1],
-    };
-  }
 
   interface ColStats {
     colIdx: number;
@@ -523,6 +565,34 @@ export function detectSheetColumns(
 
     st.avgTextLength = st.textCells > 0 ? st.totalTextLength / st.textCells : 0;
     statsMap.set(colIdx, st);
+  }
+
+  // Handle 2-column tables (either [Date, Amount] or [Amount, Description])
+  if (nonEmptyColIndices.length === 2) {
+    const c0 = nonEmptyColIndices[0];
+    const c1 = nonEmptyColIndices[1];
+    const st0 = statsMap.get(c0)!;
+    const st1 = statsMap.get(c1)!;
+    const emptyColIdx = [0, 1, 2].find((idx) => !nonEmptyColIndices.includes(idx)) ?? Math.max(c0, c1) + 1;
+
+    // If neither column has description text (or one column clearly has monthMarkers / Date header while the other is numeric Amount)
+    const hasDescText = st0.textCells > 0 || st1.textCells > 0 || st0.isDescHeader || st1.isDescHeader;
+    if (!hasDescText) {
+      const c0DateScore = st0.monthMarkers * 350 + st0.dayNumbers * 12 - st0.otherNumbers * 30 + (st0.isDateHeader ? 600 : 0);
+      const c1DateScore = st1.monthMarkers * 350 + st1.dayNumbers * 12 - st1.otherNumbers * 30 + (st1.isDateHeader ? 600 : 0);
+      if (c0DateScore >= c1DateScore) {
+        return { dateColIdx: c0, amountColIdx: c1, descColIdx: emptyColIdx };
+      } else {
+        return { dateColIdx: c1, amountColIdx: c0, descColIdx: emptyColIdx };
+      }
+    } else {
+      // [Amount, Description]
+      if (st0.allNumbers >= st1.allNumbers) {
+        return { dateColIdx: emptyColIdx, amountColIdx: c0, descColIdx: c1 };
+      } else {
+        return { dateColIdx: emptyColIdx, amountColIdx: c1, descColIdx: c0 };
+      }
+    }
   }
 
   // 1. Pick Description Column: column with longest text ("cột chứa chữ dài nhất là Diễn giải")
@@ -665,11 +735,14 @@ export async function readRawExcelWorkbook(file: File): Promise<RawWorkbookData>
         if (cellObj && cellObj.v !== undefined && cellObj.v !== null) {
           value = cellObj.v;
           text = String(cellObj.v).trim();
-          // If formatted text is cleaner for strings, still keep raw value
+          // If formatted text is cleaner for strings or month markers (e.g. "9.2020"), keep formatted text
           if (typeof cellObj.v === 'string') {
             text = cellObj.v.trim();
-          } else if (cellObj.w && typeof cellObj.v !== 'number') {
-            text = String(cellObj.w).trim();
+          } else if (cellObj.w) {
+            const wTrim = String(cellObj.w).trim();
+            if (typeof cellObj.v !== 'number' || MONTH_MARKER_REGEX.test(wTrim)) {
+              text = wTrim;
+            }
           }
         }
 
@@ -791,7 +864,7 @@ export function revalidatePreviewItems(items: PreviewExpenseItem[]): PreviewExpe
       } else {
         if (prevDayInMonth !== null && day < prevDayInMonth) {
           warnings.push(
-            `Ngày ${day} nhỏ hơn ngày trước đó (${prevDayInMonth}) trong cùng ${monthLabel} (có thể thiếu mốc tháng)`
+            `Ngày ${day} nhỏ hơn ngày liền trước (${prevDayInMonth}) trong cùng ${monthLabel} mà không có mốc tháng xen giữa (có thể là lỗi gõ liệu hoặc thiếu mốc tháng)`
           );
           warningTypes.push('day_decreased');
         }
@@ -821,9 +894,11 @@ export function buildImportPreview(
     startYear: number;
     unitMode: AmountUnitMode;
     sheetMappings?: Record<string, SheetColumnMapping>;
+    defaultMonthNum?: number | null;
+    defaultDay?: number | null;
   }
 ): ExcelImportResult {
-  const { startYear, unitMode, sheetMappings } = options;
+  const { startYear, unitMode, sheetMappings, defaultMonthNum = null, defaultDay = null } = options;
   const allItems: PreviewExpenseItem[] = [];
   const sheetsInfo: ParsedSheetInfo[] = [];
   const monthsFoundSet = new Set<string>();
@@ -840,24 +915,29 @@ export function buildImportPreview(
     for (let r = 0; r < sheet.rows.length; r++) {
       const row = sheet.rows[r];
       if (!row || row.length === 0) continue;
-      const dateCellText = row[dateColIdx]?.text || '';
-      if (matchMonthHeader(dateCellText).isMonth) {
+      const dCell = row[dateColIdx];
+      const aCell = row[amountColIdx];
+      const dStr = dCell ? (dCell.text !== '' ? dCell.text : String(dCell.value ?? '')) : '';
+      const aStr = aCell ? (aCell.text !== '' ? aCell.text : String(aCell.value ?? '')) : '';
+      if (matchMonthHeader(dStr, aStr).isMonth) {
         sheetHasInternalMonthMarkers = true;
         break;
       }
     }
 
-    let currentMonthNum: number | null = null;
-    let currentDay: number | null = null;
+    let currentMonthNum: number | null =
+      defaultMonthNum && defaultMonthNum >= 1 && defaultMonthNum <= 12
+        ? defaultMonthNum
+        : null;
+    let currentDay: number | null =
+      defaultDay && defaultDay >= 1 && defaultDay <= 31 ? defaultDay : null;
 
     // If sheet has no internal month markers, check if the sheet name itself is a month marker (e.g. "t3")
     if (!sheetHasInternalMonthMarkers) {
       const sheetMonthMatch = matchMonthHeader(sheet.sheetName);
       if (sheetMonthMatch.isMonth && sheetMonthMatch.monthNum) {
-        if (sheetMonthMatch.explicitYear) {
+        if (sheetMonthMatch.explicitYear !== undefined) {
           currentYear = sheetMonthMatch.explicitYear;
-        } else if (lastMonthNum !== null && sheetMonthMatch.monthNum < lastMonthNum) {
-          currentYear += 1;
         }
         lastMonthNum = sheetMonthMatch.monthNum;
         currentMonthNum = sheetMonthMatch.monthNum;
@@ -874,8 +954,15 @@ export function buildImportPreview(
       const amountCell: RawCell = row[amountColIdx] || { value: '', text: '', comment: '' };
       const descCell: RawCell = row[descColIdx] || { value: '', text: '', comment: '' };
 
+      const dateCellStr =
+        dateCell.text !== '' ? dateCell.text.trim() : String(dateCell.value ?? '').trim();
+      const amountCellStr =
+        amountCell.text !== '' ? amountCell.text.trim() : String(amountCell.value ?? '').trim();
+      const descCellStr = descCell.text.trim();
+      const isAmountCellEmpty = amountCellStr === '';
+
       // Rule 3: Completely empty row (no date, no amount, no description) -> skip without affecting currentDay
-      if (dateCell.text === '' && amountCell.text === '' && descCell.text === '') {
+      if (dateCellStr === '' && isAmountCellEmpty && descCellStr === '') {
         // Check if another cell on this row is a standalone month header
         let standaloneMonth: ReturnType<typeof matchMonthHeader> | null = null;
         for (let c = 0; c < row.length; c++) {
@@ -888,42 +975,55 @@ export function buildImportPreview(
           }
         }
         if (standaloneMonth && standaloneMonth.monthNum) {
-          if (standaloneMonth.explicitYear) {
+          if (standaloneMonth.explicitYear !== undefined) {
             currentYear = standaloneMonth.explicitYear;
-          } else if (lastMonthNum !== null && standaloneMonth.monthNum < lastMonthNum) {
-            currentYear += 1;
           }
           lastMonthNum = standaloneMonth.monthNum;
           currentMonthNum = standaloneMonth.monthNum;
-          currentDay = null; // Rule 2: Reset day when entering new month
+          currentDay = null; // Reset day when entering new month
         }
         continue;
       }
 
-      const rowTexts = [dateCell.text, amountCell.text, descCell.text];
+      const rowTexts = [dateCellStr, amountCellStr, descCellStr];
       if (isTotalRow(rowTexts) || isHeaderRow(rowTexts)) {
         continue;
       }
 
-      // Rule 1: Check if row is a month marker row ("t1".."t12", "T 3", "Tháng 3")
-      const dateMonthCheck = matchMonthHeader(dateCell.text);
+      // Rule 1 & Rule 2:
+      // 1. Nếu cell ở cột "ngày" match regex VÀ cell ở cột "số tiền" cùng dòng đang TRỐNG
+      //    -> đây là dòng mốc tháng, không phải khoản chi.
+      // 2. Nếu KHÔNG match, hoặc cell "số tiền" cùng dòng CÓ giá trị
+      //    -> đây vẫn là 1 khoản chi bình thường, không phải mốc tháng.
+      const dateMonthCheck = isAmountCellEmpty
+        ? matchMonthHeader(dateCellStr, amountCellStr)
+        : { isMonth: false };
+      // Nếu cột ngày có số đơn lẻ (không có "t"/"tháng" và không có năm) nhưng cột diễn giải có nội dung thì đó là khoản chi thiếu tiền, không phải mốc tháng
+      const isValidDateColMonthMarker =
+        dateMonthCheck.isMonth &&
+        (dateMonthCheck.hasPrefixOrYear || descCellStr === '');
+
       const descMonthCheck =
-        dateCell.text === '' && amountCell.text === ''
-          ? matchMonthHeader(descCell.text)
+        dateCellStr === '' && isAmountCellEmpty
+          ? matchMonthHeader(descCellStr)
           : { isMonth: false };
-      const activeMonthCheck = dateMonthCheck.isMonth ? dateMonthCheck : descMonthCheck;
+
+      const activeMonthCheck = isValidDateColMonthMarker
+        ? dateMonthCheck
+        : descMonthCheck.isMonth && descMonthCheck.hasPrefixOrYear
+        ? descMonthCheck
+        : { isMonth: false };
 
       if (activeMonthCheck.isMonth && activeMonthCheck.monthNum) {
         const mNum = activeMonthCheck.monthNum;
-        // Rule 5: If month number decreases compared to previous month marker (e.g. t12 -> t1), increment year by 1
-        if (activeMonthCheck.explicitYear) {
+        // Lấy nhóm số đầu làm "tháng", nhóm năm (nếu có) làm "năm";
+        // nếu dòng không ghi năm thì giữ nguyên năm đang parse ở dòng mốc liền trước.
+        if (activeMonthCheck.explicitYear !== undefined) {
           currentYear = activeMonthCheck.explicitYear;
-        } else if (lastMonthNum !== null && mNum < lastMonthNum) {
-          currentYear += 1;
         }
         lastMonthNum = mNum;
         currentMonthNum = mNum;
-        // Rule 2: Reset day when entering a new month
+        // Reset day when entering a new month marker
         currentDay = null;
         continue;
       }
@@ -937,6 +1037,12 @@ export function buildImportPreview(
         const dayOnly = parseDayFromCell(dateCell);
         if (dayOnly.day !== null) {
           currentDay = dayOnly.day;
+          if (dayOnly.explicitMonth) {
+            currentMonthNum = dayOnly.explicitMonth;
+          }
+          if (dayOnly.explicitYear) {
+            currentYear = dayOnly.explicitYear;
+          }
         }
         continue;
       }
@@ -950,6 +1056,13 @@ export function buildImportPreview(
         if (dayParsed.day !== null) {
           currentDay = dayParsed.day;
           itemDay = dayParsed.day;
+          if (dayParsed.explicitMonth) {
+            currentMonthNum = dayParsed.explicitMonth;
+            lastMonthNum = dayParsed.explicitMonth;
+          }
+          if (dayParsed.explicitYear) {
+            currentYear = dayParsed.explicitYear;
+          }
         } else {
           // Invalid non-empty text in Date cell (e.g. "35" or "abc")
           itemDay = -1;
@@ -966,8 +1079,11 @@ export function buildImportPreview(
         unitMode
       );
 
-      // Skip if both amount is 0 and description is empty
-      if (finalAmount === 0 && descVal === '') {
+      // Skip if both amount is 0 and description is empty, or in clipboard mode when row has no numeric amount
+      if (
+        (finalAmount === 0 && descVal === '') ||
+        (rawWorkbook.fileName === 'Clipboard_Excel' && (rawNum === null || finalAmount === 0))
+      ) {
         continue;
       }
 
@@ -1041,6 +1157,87 @@ export function buildImportPreview(
 }
 
 /**
+ * Build a RawWorkbookData from a 2D array of cell values (useful for tests & direct programmatic parsing)
+ */
+export function createRawWorkbookFromRows(
+  rawRows: (string | number | null | undefined)[][],
+  fileName = 'TestWorkbook.xlsx',
+  sheetName = 'Sheet1'
+): RawWorkbookData {
+  let maxCols = 0;
+  for (const r of rawRows) {
+    if (r && r.length > maxCols) maxCols = r.length;
+  }
+  const colCount = Math.max(maxCols, 3);
+  const rows: RawCell[][] = [];
+  const nonEmptyColsSet = new Set<number>();
+
+  for (let r = 0; r < rawRows.length; r++) {
+    const srcRow = rawRows[r] || [];
+    const rowCells: RawCell[] = [];
+    let rowHasContent = false;
+
+    for (let c = 0; c < colCount; c++) {
+      const cellVal = srcRow[c];
+      const txt = cellVal !== null && cellVal !== undefined ? String(cellVal).trim() : '';
+      const numVal = parseRawNumber(txt);
+      const value: any =
+        typeof cellVal === 'number'
+          ? cellVal
+          : numVal !== null && /^-?\d+(?:[.,]\d+)?$/.test(txt)
+          ? numVal
+          : txt;
+
+      if (txt !== '') {
+        rowHasContent = true;
+        nonEmptyColsSet.add(c);
+      }
+
+      rowCells.push({
+        value,
+        text: txt,
+        comment: '',
+      });
+    }
+
+    rows[r] = rowHasContent ? rowCells : [];
+  }
+
+  const nonEmptyCols = Array.from(nonEmptyColsSet).sort((a, b) => a - b);
+  const availableColumns: SheetColumnOption[] = [];
+  for (let c = 0; c < colCount; c++) {
+    const colLetter = XLSX.utils.encode_col(c);
+    const samples: string[] = [];
+    for (let r = 0; r < rows.length && samples.length < 4; r++) {
+      const cell = rows[r]?.[c];
+      if (cell && cell.text !== '') {
+        const short = cell.text.length > 18 ? cell.text.slice(0, 18) + '…' : cell.text;
+        samples.push(short);
+      }
+    }
+    availableColumns.push({
+      colIdx: c,
+      colLetter,
+      sampleValues: samples,
+    });
+  }
+
+  const detectedMapping = detectSheetColumns(rows, nonEmptyCols);
+
+  return {
+    fileName,
+    sheets: [
+      {
+        sheetName,
+        rows,
+        availableColumns,
+        detectedMapping,
+      },
+    ],
+  };
+}
+
+/**
  * Convenience wrapper to parse an Excel File directly
  */
 export async function parseExcelWorkbook(
@@ -1050,6 +1247,279 @@ export async function parseExcelWorkbook(
 ): Promise<ExcelImportResult> {
   const rawWorkbook = await readRawExcelWorkbook(file);
   return buildImportPreview(rawWorkbook, { startYear, unitMode });
+}
+
+/**
+ * Split TSV (Tab-Separated Values) copied from Excel into 2D string cells,
+ * properly handling multi-line quoted cells that Excel generates when a cell has Alt+Enter.
+ */
+function parseTSVRows(tsvText: string): string[][] {
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentCell = '';
+  let inQuotes = false;
+  const text = tsvText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (i + 1 < text.length && text[i + 1] === '"') {
+          currentCell += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        currentCell += ch;
+      }
+    } else {
+      if (ch === '"' && currentCell === '') {
+        inQuotes = true;
+      } else if (ch === '\t') {
+        currentRow.push(currentCell.trim());
+        currentCell = '';
+      } else if (ch === '\n') {
+        currentRow.push(currentCell.trim());
+        rows.push(currentRow);
+        currentRow = [];
+        currentCell = '';
+      } else {
+        currentCell += ch;
+      }
+    }
+  }
+
+  if (currentCell.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentCell.trim());
+    rows.push(currentRow);
+  }
+
+  return rows;
+}
+
+/**
+ * Extract 2D table cells from HTML clipboard string (when copying from Excel / Google Sheets / WPS)
+ */
+function parseHTMLTableRows(htmlText: string): string[][] | null {
+  if (!htmlText || typeof DOMParser === 'undefined') return null;
+  if (!/<table/i.test(htmlText) || !/<tr/i.test(htmlText)) return null;
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(htmlText, 'text/html');
+    const table = doc.querySelector('table');
+    if (!table) return null;
+
+    const trList = Array.from(table.querySelectorAll('tr'));
+    if (trList.length === 0) return null;
+
+    const matrix: string[][] = [];
+    for (const tr of trList) {
+      const cells = Array.from(tr.querySelectorAll('td, th'));
+      if (cells.length === 0) continue;
+      const rowValues: string[] = [];
+      for (const td of cells) {
+        // Replace <br> with space so multiline cell text stays clean
+        const clone = td.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll('br').forEach((br) => br.replaceWith(' '));
+        const cellText = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+        const colspan = Math.max(1, Math.min(10, parseInt(td.getAttribute('colspan') || '1', 10) || 1));
+        rowValues.push(cellText);
+        for (let k = 1; k < colspan; k++) {
+          rowValues.push('');
+        }
+      }
+      matrix.push(rowValues);
+    }
+
+    return matrix.length > 0 ? matrix : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Quick check if clipboard text/html looks like tabular Excel data
+ */
+export function isClipboardTableLike(plainText: string, htmlText?: string): boolean {
+  if (htmlText && /<table[\s>]/i.test(htmlText) && /<td[\s>]/i.test(htmlText)) {
+    return true;
+  }
+  if (!plainText || !plainText.trim()) return false;
+  if (plainText.includes('\t')) return true;
+
+  // Check if multiple lines have pipe or 2+ spaces separating columns with numbers
+  const lines = plainText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false;
+
+  let tabularLineCount = 0;
+  for (const line of lines) {
+    if (matchMonthHeader(line).isMonth) {
+      tabularLineCount++;
+      continue;
+    }
+    const parts = line.includes('|')
+      ? line.split('|').map((s) => s.trim())
+      : line.split(/\s{2,}/).map((s) => s.trim());
+    if (parts.length >= 2 && parts.some((p) => parseRawNumber(p) !== null)) {
+      tabularLineCount++;
+    }
+  }
+
+  return tabularLineCount > 0 && tabularLineCount >= Math.ceil(lines.length * 0.5);
+}
+
+/**
+ * Parse clipboard plain text (TSV) or HTML table into RawWorkbookData
+ * so it uses the exact same column mapping, t1..t12 month markers, and forward-fill Day logic as Excel import.
+ * Returns null if the content is not recognizable as a table.
+ */
+export function parseClipboardToRawWorkbook(
+  plainText: string,
+  htmlText?: string
+): RawWorkbookData | null {
+  let rawStringRows: string[][] | null = null;
+
+  // 1. Prefer HTML table if available AND plainText doesn't have more rows
+  const htmlRows = htmlText ? parseHTMLTableRows(htmlText) : null;
+  const hasTabs = Boolean(plainText && plainText.includes('\t'));
+
+  if (hasTabs) {
+    rawStringRows = parseTSVRows(plainText);
+  } else if (htmlRows && htmlRows.length > 0) {
+    rawStringRows = htmlRows;
+  } else if (plainText && plainText.trim()) {
+    // Check if separated by '|' or 2+ spaces
+    const lines = plainText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    const splitRows: string[][] = [];
+    let hasMultiCol = false;
+
+    for (const line of lines) {
+      if (matchMonthHeader(line).isMonth) {
+        splitRows.push([line, '', '']);
+        continue;
+      }
+      if (line.includes('|')) {
+        const cols = line
+          .split('|')
+          .map((c) => c.trim())
+          .filter((_, idx, arr) => !( (idx === 0 || idx === arr.length - 1) && arr[idx] === '' ));
+        if (cols.length >= 2) hasMultiCol = true;
+        splitRows.push(cols);
+      } else if (/\s{2,}/.test(line)) {
+        const cols = line.split(/\s{2,}/).map((c) => c.trim());
+        if (cols.length >= 2) hasMultiCol = true;
+        splitRows.push(cols);
+      } else {
+        // Also support simple "Day Amount Description" or "Amount Description" row if part of a pasted table
+        const m3 = line.match(/^(\d{1,2}(?:[\/\-]\d{1,2}(?:[\/\-]\d{2,4})?)?)\s+(-?\d[\d.,]*k?)\s+(.+)$/i);
+        if (m3) {
+          hasMultiCol = true;
+          splitRows.push([m3[1], m3[2], m3[3]]);
+        } else {
+          const m2 = line.match(/^(-?\d[\d.,]*k?)\s+(.+)$/i);
+          if (m2 && parseRawNumber(m2[1]) !== null) {
+            hasMultiCol = true;
+            splitRows.push(['', m2[1], m2[2]]);
+          } else {
+            splitRows.push([line]);
+          }
+        }
+      }
+    }
+
+    if (hasMultiCol) {
+      rawStringRows = splitRows;
+    }
+  }
+
+  if (!rawStringRows || rawStringRows.length === 0) {
+    return null;
+  }
+
+  // Filter out trailing/leading completely empty rows and find max columns
+  let maxCols = 0;
+  for (const r of rawStringRows) {
+    if (r.length > maxCols) maxCols = r.length;
+  }
+
+  if (maxCols === 0) return null;
+
+  // Ensure at least 3 columns so Date / Amount / Description always have distinct slots
+  const colCount = Math.max(maxCols, 3);
+  const rows: RawCell[][] = [];
+  const nonEmptyColsSet = new Set<number>();
+
+  for (let r = 0; r < rawStringRows.length; r++) {
+    const srcRow = rawStringRows[r];
+    const rowCells: RawCell[] = [];
+    let rowHasContent = false;
+
+    for (let c = 0; c < colCount; c++) {
+      const txt = (srcRow[c] ?? '').trim();
+      const numVal = parseRawNumber(txt);
+      // Keep raw numeric value if it's a pure number without currency suffix or slashes
+      const value: any =
+        numVal !== null && /^-?\d+(?:[.,]\d+)?$/.test(txt) ? numVal : txt;
+
+      if (txt !== '') {
+        rowHasContent = true;
+        nonEmptyColsSet.add(c);
+      }
+
+      rowCells.push({
+        value,
+        text: txt,
+        comment: '',
+      });
+    }
+
+    rows[r] = rowHasContent ? rowCells : [];
+  }
+
+  const nonEmptyCols = Array.from(nonEmptyColsSet).sort((a, b) => a - b);
+  if (nonEmptyCols.length === 0) return null;
+
+  // Build availableColumns
+  const availableColumns: SheetColumnOption[] = [];
+  for (let c = 0; c < colCount; c++) {
+    const colLetter = XLSX.utils.encode_col(c);
+    const samples: string[] = [];
+    for (let r = 0; r < rows.length && samples.length < 4; r++) {
+      const cell = rows[r]?.[c];
+      if (cell && cell.text !== '') {
+        const short = cell.text.length > 18 ? cell.text.slice(0, 18) + '…' : cell.text;
+        samples.push(short);
+      }
+    }
+    availableColumns.push({
+      colIdx: c,
+      colLetter,
+      sampleValues: samples,
+    });
+  }
+
+  const detectedMapping = detectSheetColumns(rows, nonEmptyCols);
+
+  return {
+    fileName: 'Clipboard_Excel',
+    sheets: [
+      {
+        sheetName: 'Vùng dán Excel',
+        rows,
+        availableColumns,
+        detectedMapping,
+      },
+    ],
+  };
 }
 
 /**

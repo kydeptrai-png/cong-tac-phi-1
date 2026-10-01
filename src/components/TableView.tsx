@@ -10,6 +10,12 @@ import {
   AlertTriangle,
   Copy,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ChevronsDown,
+  ChevronsUp,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 import { ExpenseItem, MonthGroup } from '../types';
 import { formatVND } from '../utils/categories';
@@ -31,6 +37,13 @@ interface TableViewProps {
   onToggleSelect?: (id: string) => void;
   onToggleSelectAll?: () => void;
   isAllSelected?: boolean;
+  settledMonthKeys?: Set<string>;
+  collapsedMonthKeys?: Set<string>;
+  onToggleCollapseMonth?: (monthKey: string) => void;
+  onToggleSettleMonth?: (monthKey: string, monthTitle: string) => void;
+  onCollapseAllSettled?: () => void;
+  onCollapseAllMonths?: () => void;
+  onExpandAllMonths?: () => void;
 }
 
 export const TableView: React.FC<TableViewProps> = ({
@@ -49,7 +62,24 @@ export const TableView: React.FC<TableViewProps> = ({
   onToggleSelect,
   onToggleSelectAll,
   isAllSelected = false,
+  settledMonthKeys = new Set(),
+  collapsedMonthKeys = new Set(),
+  onToggleCollapseMonth,
+  onToggleSettleMonth,
+  onCollapseAllSettled,
+  onCollapseAllMonths,
+  onExpandAllMonths,
 }) => {
+  const settledInViewCount = monthGroups.filter((g) =>
+    settledMonthKeys.has(g.monthKey)
+  ).length;
+  const collapsedInViewCount = monthGroups.filter((g) =>
+    collapsedMonthKeys.has(g.monthKey)
+  ).length;
+  const hasExpandedSettledMonth = monthGroups.some(
+    (g) => settledMonthKeys.has(g.monthKey) && !collapsedMonthKeys.has(g.monthKey)
+  );
+
   return (
     <div className="space-y-5">
       {/* Requirement 2: Missing Receipts Summary Banner at the top of the list */}
@@ -96,6 +126,64 @@ export const TableView: React.FC<TableViewProps> = ({
         </div>
       )}
 
+      {/* Quick Collapse / Expand / Settled Months Control Bar */}
+      {monthGroups.length > 0 && (
+        <div className="bg-white border border-slate-200/90 rounded-2xl px-3.5 py-2.5 shadow-2xs flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div className="flex flex-wrap items-center gap-2 text-slate-600">
+            <span className="font-semibold text-slate-800">
+              Hiển thị {monthGroups.length} tháng
+            </span>
+            {settledInViewCount > 0 && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 border border-emerald-200 font-semibold text-[11px]">
+                <Lock size={11} className="text-emerald-600" />
+                <span>Đã chốt {settledInViewCount} tháng</span>
+              </span>
+            )}
+            {collapsedInViewCount > 0 && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200 font-medium text-[11px]">
+                <span>Đang thu gọn {collapsedInViewCount} tháng</span>
+              </span>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            {hasExpandedSettledMonth && onCollapseAllSettled && (
+              <button
+                type="button"
+                onClick={onCollapseAllSettled}
+                className="px-2.5 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                title="Thu gọn tất cả các tháng đã đánh dấu chốt sổ"
+              >
+                <Lock size={12} />
+                <span>Thu gọn tháng đã chốt</span>
+              </button>
+            )}
+            {collapsedInViewCount < monthGroups.length && onCollapseAllMonths && (
+              <button
+                type="button"
+                onClick={onCollapseAllMonths}
+                className="px-2.5 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                title="Thu gọn toàn bộ các tháng"
+              >
+                <ChevronsUp size={13} />
+                <span>Thu gọn tất cả</span>
+              </button>
+            )}
+            {collapsedInViewCount > 0 && onExpandAllMonths && (
+              <button
+                type="button"
+                onClick={onExpandAllMonths}
+                className="px-2.5 py-1.5 rounded-xl bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                title="Mở rộng toàn bộ các tháng"
+              >
+                <ChevronsDown size={13} />
+                <span>Mở rộng tất cả</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {monthGroups.length === 0 ? (
         <div className="bg-white rounded-2xl p-12 text-center border border-slate-200 shadow-xs">
           <Calendar size={48} className="mx-auto text-slate-300 mb-3" />
@@ -116,39 +204,141 @@ export const TableView: React.FC<TableViewProps> = ({
             const items = [...group.items].sort(
               (a, b) => parseDateSortKey(a.date || '') - parseDateSortKey(b.date || '')
             );
+            const isSettled = settledMonthKeys.has(group.monthKey);
+            const isCollapsed = collapsedMonthKeys.has(group.monthKey);
+            const missingInMonth = group.items.filter(
+              (it) => !it.images || it.images.length === 0
+            ).length;
 
             return (
               <div
                 key={group.monthKey}
-                className="bg-white rounded-2xl border border-slate-200/90 shadow-xs overflow-hidden"
+                className={`bg-white rounded-2xl border shadow-xs overflow-hidden transition-all ${
+                  isSettled ? 'border-emerald-300/90' : 'border-slate-200/90'
+                }`}
               >
                 {/* Month Header Banner */}
-                <div className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3.5 bg-slate-50/90 border-b border-slate-200/80">
-                  <div className="flex items-center gap-3">
-                    <div className="w-2.5 h-6 bg-teal-600 rounded-full" />
+                <div
+                  className={`flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3.5 ${
+                    !isCollapsed ? 'border-b border-slate-200/80' : ''
+                  } ${
+                    isSettled
+                      ? 'bg-gradient-to-r from-emerald-50/80 via-teal-50/50 to-slate-50'
+                      : 'bg-slate-50/90'
+                  }`}
+                >
+                  {/* Clickable Left Title & Status */}
+                  <div
+                    onClick={() => onToggleCollapseMonth?.(group.monthKey)}
+                    className="flex items-center gap-3 cursor-pointer select-none group flex-1 min-w-[200px]"
+                    title={isCollapsed ? 'Bấm để mở rộng chi tiết tháng này' : 'Bấm để thu gọn tháng này'}
+                  >
+                    <button
+                      type="button"
+                      aria-label={isCollapsed ? 'Mở rộng tháng' : 'Thu gọn tháng'}
+                      className={`w-8 h-8 rounded-xl flex items-center justify-center border transition-colors shrink-0 ${
+                        isCollapsed
+                          ? 'bg-white text-teal-800 border-teal-300 group-hover:bg-teal-50'
+                          : 'bg-teal-600/10 text-teal-800 border-teal-200 group-hover:bg-teal-600/20'
+                      }`}
+                    >
+                      {isCollapsed ? <ChevronRight size={18} /> : <ChevronDown size={18} />}
+                    </button>
+
                     <div>
-                      <h3 className="text-sm sm:text-base font-bold text-slate-800 uppercase tracking-wide">
-                        {group.monthTitle}
-                      </h3>
-                      <p className="text-xs text-slate-500 font-medium">
-                        {group.count} khoản chi tiêu
-                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm sm:text-base font-bold text-slate-800 uppercase tracking-wide">
+                          {group.monthTitle}
+                        </h3>
+                        {isSettled && (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-700 text-white shadow-2xs">
+                            <Lock size={10} />
+                            <span>Đã chốt</span>
+                          </span>
+                        )}
+                        {isCollapsed && (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-white text-slate-600 border border-slate-200">
+                            Đang thu gọn
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 font-medium mt-0.5">
+                        <span>{group.count} khoản chi tiêu</span>
+                        {missingInMonth > 0 && (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800">
+                            • <AlertTriangle size={11} className="text-amber-600" />
+                            <span>Thiếu {missingInMonth} ảnh</span>
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-3">
-                    <div className="text-right">
+                  {/* Right Total & Action Buttons */}
+                  <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+                    <div className="text-right mr-1">
                       <span className="text-[11px] text-slate-500 block uppercase font-medium">
                         Tổng tháng
                       </span>
-                      <span className="text-sm sm:text-base font-bold text-teal-800">
+                      <span className="text-sm sm:text-base font-bold font-mono text-teal-800">
                         {formatVND(group.totalAmount)}
                       </span>
                     </div>
+
+                    {onToggleSettleMonth && (
+                      <button
+                        type="button"
+                        onClick={() => onToggleSettleMonth(group.monthKey, group.monthTitle)}
+                        title={
+                          isSettled
+                            ? 'Bỏ trạng thái chốt sổ tháng này để tiếp tục chỉnh sửa'
+                            : 'Đánh dấu tháng này đã chốt sổ và tự động thu gọn'
+                        }
+                        className={`min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 border transition-colors cursor-pointer ${
+                          isSettled
+                            ? 'bg-white hover:bg-amber-50 text-slate-700 hover:text-amber-900 border-slate-300'
+                            : 'bg-emerald-700 hover:bg-emerald-800 text-white border-emerald-700 shadow-2xs'
+                        }`}
+                      >
+                        {isSettled ? (
+                          <>
+                            <Unlock size={13} />
+                            <span>Mở chốt</span>
+                          </>
+                        ) : (
+                          <>
+                            <Lock size={13} />
+                            <span>Chốt tháng</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+
+                    {onToggleCollapseMonth && (
+                      <button
+                        type="button"
+                        onClick={() => onToggleCollapseMonth(group.monthKey)}
+                        className="min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-semibold bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 flex items-center gap-1 transition-colors cursor-pointer"
+                      >
+                        {isCollapsed ? (
+                          <>
+                            <ChevronDown size={14} />
+                            <span>Mở rộng ({group.count})</span>
+                          </>
+                        ) : (
+                          <>
+                            <ChevronRight size={14} className="-rotate-90" />
+                            <span>Thu gọn</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+
                     <button
+                      type="button"
                       onClick={() => onAddNewToMonth(group.monthTitle)}
                       title={`Thêm khoản chi vào ${group.monthTitle}`}
-                      className="flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-xl border border-teal-200/60 transition-colors cursor-pointer"
+                      className="min-h-[36px] flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-xl border border-teal-200/60 transition-colors cursor-pointer"
                     >
                       <Plus size={14} />
                       <span className="hidden sm:inline">Thêm vào tháng</span>
@@ -156,189 +346,191 @@ export const TableView: React.FC<TableViewProps> = ({
                   </div>
                 </div>
 
-                {/* Responsive Table Wrapper */}
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs sm:text-sm">
-                    <thead>
-                      <tr className="border-b border-slate-200/70 bg-slate-50/50 text-slate-500 text-[11px] uppercase tracking-wider font-semibold">
-                        {onToggleSelect && (
-                          <th className="py-2.5 px-2.5 sm:px-3 w-10 text-center">
-                            <input
-                              type="checkbox"
-                              checked={isAllSelected}
-                              onChange={onToggleSelectAll}
-                              className="rounded text-teal-700 focus:ring-teal-500 cursor-pointer"
-                              title={isAllSelected ? 'Bỏ chọn tất cả' : 'Chọn tất cả'}
-                            />
-                          </th>
-                        )}
-                        <th className="py-2.5 px-3 sm:px-4 w-12 text-center">STT</th>
-                        <th className="py-2.5 px-3 sm:px-4 w-28">Ngày</th>
-                        <th className="py-2.5 px-3 sm:px-4 min-w-[200px]">Diễn giải</th>
-                        <th className="py-2.5 px-3 sm:px-4 w-32 text-right">Số tiền</th>
-                        <th className="py-2.5 px-3 sm:px-4 w-32 text-center">Chứng từ</th>
-                        <th className="py-2.5 px-3 sm:px-4 w-24 text-center">Thao tác</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {items.map((item, index) => {
-                        const hasImages = (item.images || []).length > 0;
-                        const isRefund = item.amount < 0;
-                        const isSuspectedDuplicate = duplicateIdsSet.has(item.id);
-                        const isSelected = selectedIds.has(item.id);
+                {/* Responsive Table Wrapper (Hidden when month is collapsed) */}
+                {!isCollapsed && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs sm:text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-200/70 bg-slate-50/50 text-slate-500 text-[11px] uppercase tracking-wider font-semibold">
+                          {onToggleSelect && (
+                            <th className="py-2.5 px-2.5 sm:px-3 w-10 text-center">
+                              <input
+                                type="checkbox"
+                                checked={isAllSelected}
+                                onChange={onToggleSelectAll}
+                                className="rounded text-teal-700 focus:ring-teal-500 cursor-pointer"
+                                title={isAllSelected ? 'Bỏ chọn tất cả' : 'Chọn tất cả'}
+                              />
+                            </th>
+                          )}
+                          <th className="py-2.5 px-3 sm:px-4 w-12 text-center">STT</th>
+                          <th className="py-2.5 px-3 sm:px-4 w-28">Ngày</th>
+                          <th className="py-2.5 px-3 sm:px-4 min-w-[200px]">Diễn giải</th>
+                          <th className="py-2.5 px-3 sm:px-4 w-32 text-right">Số tiền</th>
+                          <th className="py-2.5 px-3 sm:px-4 w-32 text-center">Chứng từ</th>
+                          <th className="py-2.5 px-3 sm:px-4 w-24 text-center">Thao tác</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {items.map((item, index) => {
+                          const hasImages = (item.images || []).length > 0;
+                          const isRefund = item.amount < 0;
+                          const isSuspectedDuplicate = duplicateIdsSet.has(item.id);
+                          const isSelected = selectedIds.has(item.id);
 
-                        return (
-                          <tr
-                            key={item.id}
-                            className={`transition-colors group ${
-                              isSelected
-                                ? 'bg-teal-100/60 hover:bg-teal-100/80'
-                                : isSuspectedDuplicate
-                                ? 'bg-amber-50/45 hover:bg-amber-50/80'
-                                : isRefund
-                                ? 'bg-cyan-50/30 hover:bg-cyan-50/60'
-                                : 'hover:bg-teal-50/20'
-                            }`}
-                          >
-                            {/* Checkbox */}
-                            {onToggleSelect && (
-                              <td className="py-2 px-1 text-center">
-                                <label className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center cursor-pointer">
-                                  <input
-                                    type="checkbox"
-                                    checked={isSelected}
-                                    onChange={() => onToggleSelect(item.id)}
-                                    className="w-4 h-4 rounded text-teal-700 focus:ring-teal-500 cursor-pointer"
-                                  />
-                                </label>
-                              </td>
-                            )}
-
-                            {/* STT */}
-                            <td className="py-3 px-3 sm:px-4 text-center text-slate-400 font-mono text-xs">
-                              {index + 1}
-                            </td>
-
-                            {/* Ngày */}
-                            <td className="py-3 px-3 sm:px-4 text-slate-600 font-medium whitespace-nowrap">
-                              {item.date}
-                            </td>
-
-                            {/* Diễn giải, Cảnh báo trùng & Ghi chú comment */}
-                            <td className="py-3 px-3 sm:px-4 text-slate-800 font-medium">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span>{item.description}</span>
-                                {isRefund && (
-                                  <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-cyan-100 text-cyan-800 border border-cyan-200">
-                                    Hoàn/thu lại
-                                  </span>
-                                )}
-                                {/* Requirement 3: Subtle duplicate indicator */}
-                                {isSuspectedDuplicate && (
-                                  <span
-                                    className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-900 border border-amber-300"
-                                    title="Khoản chi này có cùng Ngày, Số tiền và Diễn giải với một dòng khác"
-                                  >
-                                    <Copy size={10} className="text-amber-700" />
-                                    <span>Nghi trùng</span>
-                                  </span>
-                                )}
-                              </div>
-                              {item.notes && (
-                                <div className="inline-flex items-center gap-1 text-[11px] text-amber-900 bg-yellow-50/90 border border-yellow-200/90 px-2 py-0.5 rounded-md mt-1">
-                                  <MessageSquare size={11} className="text-amber-600 shrink-0" />
-                                  <span>{item.notes}</span>
-                                </div>
-                              )}
-                            </td>
-
-                            {/* Số tiền */}
-                            <td
-                              className={`py-3 px-3 sm:px-4 text-right whitespace-nowrap font-bold font-mono ${
-                                isRefund ? 'text-cyan-700' : 'text-slate-900'
+                          return (
+                            <tr
+                              key={item.id}
+                              className={`transition-colors group ${
+                                isSelected
+                                  ? 'bg-teal-100/60 hover:bg-teal-100/80'
+                                  : isSuspectedDuplicate
+                                  ? 'bg-amber-50/45 hover:bg-amber-50/80'
+                                  : isRefund
+                                  ? 'bg-cyan-50/30 hover:bg-cyan-50/60'
+                                  : 'hover:bg-teal-50/20'
                               }`}
                             >
-                              {formatVND(item.amount)}
-                            </td>
+                              {/* Checkbox */}
+                              {onToggleSelect && (
+                                <td className="py-2 px-1 text-center">
+                                  <label className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center cursor-pointer">
+                                    <input
+                                      type="checkbox"
+                                      checked={isSelected}
+                                      onChange={() => onToggleSelect(item.id)}
+                                      className="w-4 h-4 rounded text-teal-700 focus:ring-teal-500 cursor-pointer"
+                                    />
+                                  </label>
+                                </td>
+                              )}
 
-                            {/* Requirement 2: Ảnh chứng từ (dòng thiếu ảnh có biểu tượng cảnh báo) */}
-                            <td className="py-2 px-2 text-center whitespace-nowrap">
-                              <button
-                                onClick={() => onOpenReceiptViewer(item)}
-                                title={
-                                  hasImages
-                                    ? `Xem ${item.images.length} ảnh chứng từ`
-                                    : 'Chưa có ảnh chứng từ — Bấm để chụp hoặc thêm ảnh'
-                                }
-                                className={`min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-                                  hasImages
-                                    ? 'bg-teal-50 text-teal-700 hover:bg-teal-100 active:bg-teal-200 border border-teal-200'
-                                    : 'bg-amber-50/80 text-amber-800 hover:bg-amber-100 active:bg-amber-200 border border-amber-200/90'
+                              {/* STT */}
+                              <td className="py-3 px-3 sm:px-4 text-center text-slate-400 font-mono text-xs">
+                                {index + 1}
+                              </td>
+
+                              {/* Ngày */}
+                              <td className="py-3 px-3 sm:px-4 text-slate-600 font-medium whitespace-nowrap">
+                                {item.date}
+                              </td>
+
+                              {/* Diễn giải, Cảnh báo trùng & Ghi chú comment */}
+                              <td className="py-3 px-3 sm:px-4 text-slate-800 font-medium">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  <span>{item.description}</span>
+                                  {isRefund && (
+                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-cyan-100 text-cyan-800 border border-cyan-200">
+                                      Hoàn/thu lại
+                                    </span>
+                                  )}
+                                  {/* Requirement 3: Subtle duplicate indicator */}
+                                  {isSuspectedDuplicate && (
+                                    <span
+                                      className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-900 border border-amber-300"
+                                      title="Khoản chi này có cùng Ngày, Số tiền và Diễn giải với một dòng khác"
+                                    >
+                                      <Copy size={10} className="text-amber-700" />
+                                      <span>Nghi trùng</span>
+                                    </span>
+                                  )}
+                                </div>
+                                {item.notes && (
+                                  <div className="inline-flex items-center gap-1 text-[11px] text-amber-900 bg-yellow-50/90 border border-yellow-200/90 px-2 py-0.5 rounded-md mt-1">
+                                    <MessageSquare size={11} className="text-amber-600 shrink-0" />
+                                    <span>{item.notes}</span>
+                                  </div>
+                                )}
+                              </td>
+
+                              {/* Số tiền */}
+                              <td
+                                className={`py-3 px-3 sm:px-4 text-right whitespace-nowrap font-bold font-mono ${
+                                  isRefund ? 'text-cyan-700' : 'text-slate-900'
                                 }`}
                               >
-                                {hasImages ? (
-                                  <>
-                                    <ImageIcon size={15} className="text-teal-600" />
-                                    <span className="font-semibold">{item.images.length}</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <AlertTriangle size={14} className="text-amber-600 shrink-0" />
-                                    <Camera size={14} className="text-amber-700 shrink-0" />
-                                    <span className="text-[11px] font-semibold">Thiếu ảnh</span>
-                                  </>
-                                )}
-                              </button>
-                            </td>
+                                {formatVND(item.amount)}
+                              </td>
 
-                            {/* Thao tác */}
-                            <td className="py-2 px-2 text-center whitespace-nowrap">
-                              <div className="flex items-center justify-center gap-1">
+                              {/* Requirement 2: Ảnh chứng từ (dòng thiếu ảnh có biểu tượng cảnh báo) */}
+                              <td className="py-2 px-2 text-center whitespace-nowrap">
                                 <button
-                                  onClick={() => onEditExpense(item)}
-                                  title="Sửa khoản chi"
-                                  aria-label="Sửa khoản chi"
-                                  className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-500 hover:text-teal-700 hover:bg-teal-50 active:bg-teal-100 rounded-xl transition-colors cursor-pointer"
+                                  onClick={() => onOpenReceiptViewer(item)}
+                                  title={
+                                    hasImages
+                                      ? `Xem ${item.images.length} ảnh chứng từ`
+                                      : 'Chưa có ảnh chứng từ — Bấm để chụp hoặc thêm ảnh'
+                                  }
+                                  className={`min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                                    hasImages
+                                      ? 'bg-teal-50 text-teal-700 hover:bg-teal-100 active:bg-teal-200 border border-teal-200'
+                                      : 'bg-amber-50/80 text-amber-800 hover:bg-amber-100 active:bg-amber-200 border border-amber-200/90'
+                                  }`}
                                 >
-                                  <Edit2 size={16} />
+                                  {hasImages ? (
+                                    <>
+                                      <ImageIcon size={15} className="text-teal-600" />
+                                      <span className="font-semibold">{item.images.length}</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <AlertTriangle size={14} className="text-amber-600 shrink-0" />
+                                      <Camera size={14} className="text-amber-700 shrink-0" />
+                                      <span className="text-[11px] font-semibold">Thiếu ảnh</span>
+                                    </>
+                                  )}
                                 </button>
-                                <button
-                                  onClick={() => onDeleteExpense(item.id)}
-                                  title="Xóa khoản chi"
-                                  aria-label="Xóa khoản chi"
-                                  className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-400 hover:text-rose-600 hover:bg-rose-50 active:bg-rose-100 rounded-xl transition-colors cursor-pointer"
-                                >
-                                  <Trash2 size={16} />
-                                </button>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
+                              </td>
 
-                    {/* Subtotal Row per Month */}
-                    <tfoot>
-                      <tr className="bg-slate-50 font-bold border-t-2 border-slate-200 text-slate-800">
-                        <td
-                          colSpan={onToggleSelect ? 4 : 3}
-                          className="py-3 px-4 text-right uppercase tracking-wider text-xs sm:text-sm"
-                        >
-                          Tổng cộng {group.monthTitle}:
-                        </td>
-                        <td className="py-3 px-4 text-right font-mono text-teal-800 text-sm sm:text-base">
-                          {formatVND(group.totalAmount)}
-                        </td>
-                        <td
-                          colSpan={2}
-                          className="py-3 px-4 text-xs text-slate-400 text-center font-normal"
-                        >
-                          {group.count} khoản
-                        </td>
-                      </tr>
-                    </tfoot>
-                  </table>
-                </div>
+                              {/* Thao tác */}
+                              <td className="py-2 px-2 text-center whitespace-nowrap">
+                                <div className="flex items-center justify-center gap-1">
+                                  <button
+                                    onClick={() => onEditExpense(item)}
+                                    title="Sửa khoản chi"
+                                    aria-label="Sửa khoản chi"
+                                    className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-500 hover:text-teal-700 hover:bg-teal-50 active:bg-teal-100 rounded-xl transition-colors cursor-pointer"
+                                  >
+                                    <Edit2 size={16} />
+                                  </button>
+                                  <button
+                                    onClick={() => onDeleteExpense(item.id)}
+                                    title="Xóa khoản chi"
+                                    aria-label="Xóa khoản chi"
+                                    className="min-h-[40px] min-w-[40px] flex items-center justify-center text-slate-400 hover:text-rose-600 hover:bg-rose-50 active:bg-rose-100 rounded-xl transition-colors cursor-pointer"
+                                  >
+                                    <Trash2 size={16} />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+
+                      {/* Subtotal Row per Month */}
+                      <tfoot>
+                        <tr className="bg-slate-50 font-bold border-t-2 border-slate-200 text-slate-800">
+                          <td
+                            colSpan={onToggleSelect ? 4 : 3}
+                            className="py-3 px-4 text-right uppercase tracking-wider text-xs sm:text-sm"
+                          >
+                            Tổng cộng {group.monthTitle}:
+                          </td>
+                          <td className="py-3 px-4 text-right font-mono text-teal-800 text-sm sm:text-base">
+                            {formatVND(group.totalAmount)}
+                          </td>
+                          <td
+                            colSpan={2}
+                            className="py-3 px-4 text-xs text-slate-400 text-center font-normal"
+                          >
+                            {group.count} khoản
+                          </td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                )}
               </div>
             );
           })}

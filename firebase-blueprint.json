@@ -1,0 +1,180 @@
+{
+  "entities": {
+    "UserBackupMeta": {
+      "title": "UserBackupMeta",
+      "description": "Metadata about the user's latest Google Drive backup sync state.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "driveFileId": {
+          "type": "string",
+          "description": "Google Drive backup file ID",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last sync"
+        }
+      },
+      "required": ["ownerId", "driveFileId", "updatedAt"]
+    },
+    "UserDoc": {
+      "title": "UserDoc",
+      "description": "Root user document per Firebase Auth UID for real-time multi-device sync.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user",
+          "maxLength": 200
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile sync"
+        }
+      },
+      "required": ["ownerId", "updatedAt"]
+    },
+    "ExpenseDoc": {
+      "title": "ExpenseDoc",
+      "description": "Single expense record inside users/{userId}/expenses collection.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique expense ID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the expense owner",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "day": {
+          "type": "number",
+          "description": "Day of month (1-31)"
+        },
+        "monthNum": {
+          "type": "number",
+          "description": "Month number (1-12)"
+        },
+        "year": {
+          "type": "number",
+          "description": "Four-digit year"
+        },
+        "date": {
+          "type": "string",
+          "description": "Formatted date DD/MM/YYYY",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "month": {
+          "type": "string",
+          "description": "Formatted month label e.g. Tháng 4/2026",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "amount": {
+          "type": "number",
+          "description": "Expense amount in VND"
+        },
+        "description": {
+          "type": "string",
+          "description": "Expense description",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "comment": {
+          "type": "string",
+          "description": "Optional note or Excel cell comment",
+          "maxLength": 2000
+        },
+        "notes": {
+          "type": "string",
+          "description": "Optional note alias",
+          "maxLength": 2000
+        },
+        "imageUrls": {
+          "type": "array",
+          "description": "List of cloud receipt image URLs (Storage or Drive URLs, never raw base64)"
+        },
+        "images": {
+          "type": "array",
+          "description": "Alias for receipt image URLs"
+        },
+        "sheetName": {
+          "type": "string",
+          "description": "Origin Excel sheet name",
+          "maxLength": 128
+        },
+        "profileId": {
+          "type": "string",
+          "description": "Profile / trip ID",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Creation epoch timestamp in ms"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp for last-write-wins conflict resolution"
+        },
+        "updatedAtMs": {
+          "type": "number",
+          "description": "Client epoch timestamp in ms accompanying server timestamp"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "day",
+        "monthNum",
+        "year",
+        "date",
+        "month",
+        "amount",
+        "description",
+        "createdAt",
+        "updatedAt",
+        "updatedAtMs"
+      ]
+    }
+  },
+  "firestore": {
+    "/userBackups/{userId}": {
+      "schema": { "$ref": "#/entities/UserBackupMeta" },
+      "description": "Per-user backup metadata indexed by Firebase Auth UID"
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserDoc" },
+      "description": "Root user document per Firebase Auth UID"
+    },
+    "/users/{userId}/expenses/{expenseId}": {
+      "schema": { "$ref": "#/entities/ExpenseDoc" },
+      "description": "Real-time synced expenses collection per user UID"
+    }
+  }
+}

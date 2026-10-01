@@ -511,17 +511,20 @@ export const ExportExcelModal: React.FC<ExportExcelModalProps> = ({
             </div>
           )}
 
-          {/* Backup & Restore Section */}
+          {/* Backup & Restore Section (Requirement 5: Bản sao lưu dự phòng) */}
           <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200/90 space-y-3">
             <div className="flex items-center justify-between gap-2">
               <div className="text-xs font-bold text-slate-800 uppercase tracking-wide flex items-center gap-1.5">
                 <Database size={15} className="text-teal-700" />
-                <span>Sao lưu &amp; Khôi phục dữ liệu (JSON)</span>
+                <span>Bản sao lưu dự phòng &amp; Khôi phục (JSON)</span>
               </div>
               <span className="text-[11px] font-semibold text-slate-500 bg-white px-2 py-0.5 rounded-md border border-slate-200">
                 Hiện có: {expenses.length} khoản · {currentTotalImages} ảnh
               </span>
             </div>
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              Dữ liệu khoản chi được đồng bộ thời gian thực giữa các thiết bị qua <strong>Firebase Firestore</strong>. File JSON dưới đây đóng vai trò là <strong>bản sao lưu dự phòng</strong> để lưu trữ ngoại tuyến hoặc khôi phục lại khi cần.
+            </p>
 
             {/* Requirement 12: Auto-backup toggle & status */}
             {onToggleAutoBackup && (

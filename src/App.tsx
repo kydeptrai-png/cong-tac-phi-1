@@ -7,6 +7,7 @@ import {
   Upload,
   CheckCircle2,
   MessageSquareText,
+  ClipboardPaste,
   Settings,
 } from 'lucide-react';
 import {
@@ -41,7 +42,12 @@ import {
   requestPersistentStorage,
 } from './utils/db';
 import { INITIAL_SAMPLE_EXPENSES } from './utils/sampleData';
-import { groupExpensesByMonth, parseMonthYearSortKey, parseDateSortKey } from './utils/excel';
+import {
+  groupExpensesByMonth,
+  parseMonthYearSortKey,
+  parseDateSortKey,
+  isClipboardTableLike,
+} from './utils/excel';
 import { exportExpensesToPDF } from './utils/pdfExport';
 import { removeVietnameseAccents } from './utils/categories';
 import { Header } from './components/Header';
@@ -55,6 +61,7 @@ import { ExportExcelModal } from './components/ExportExcelModal';
 import { NaturalExpenseInput } from './components/NaturalExpenseInput';
 import { AdvancePaymentPanel } from './components/AdvancePaymentPanel';
 import { BulkMessageModal } from './components/BulkMessageModal';
+import { PasteExcelModal, InitialClipboardPayload } from './components/PasteExcelModal';
 import { AutoBackupBar } from './components/AutoBackupBar';
 import { BatchOperationsBar } from './components/BatchOperationsBar';
 import { PWAInstallBanner } from './components/PWAInstallBanner';
@@ -85,10 +92,23 @@ import {
   loadAppUIContextSnapshot,
   clearAppUIContextSnapshot,
 } from './utils/googleDrive';
+import {
+  RealtimeSyncStatus,
+  getFirebaseAuthInstance,
+  onAuthStateChanged,
+  ensureRootUserDocument,
+  subscribeToUserExpensesRealtime,
+  syncExpenseToFirestore,
+  syncExpensesBulkToFirestore,
+  deleteExpenseFromFirestore,
+  deleteExpensesBulkFromFirestore,
+} from './utils/cloudSync';
 
 const AUTO_BACKUP_STORAGE_KEY = 'so_chi_tieu_auto_backup_enabled';
 const LAST_BACKUP_TIME_KEY = 'so_chi_tieu_last_backup_time';
 const LAST_BACKUP_FILE_KEY = 'so_chi_tieu_last_backup_file';
+const SETTLED_MONTHS_STORAGE_KEY = 'so_chi_tieu_settled_months_v1';
+const COLLAPSED_MONTHS_STORAGE_KEY = 'so_chi_tieu_collapsed_months_v1';
 
 export default function App() {
   const [expenses, setExpenses] = useState<ExpenseItem[]>([]);
@@ -114,6 +134,134 @@ export default function App() {
   // Requirement 8: Multi-selection for batch operations
   const [selectedExpenseIds, setSelectedExpenseIds] = useState<Set<string>>(new Set());
 
+  // Settled ("Đã chốt") and Collapsed ("Thu gọn") months state persisted in localStorage
+  const [settledMonthsMap, setSettledMonthsMap] = useState<Record<string, string[]>>(() => {
+    try {
+      const raw = localStorage.getItem(SETTLED_MONTHS_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [collapsedMonthsMap, setCollapsedMonthsMap] = useState<Record<string, string[]>>(() => {
+    try {
+      const raw = localStorage.getItem(COLLAPSED_MONTHS_STORAGE_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SETTLED_MONTHS_STORAGE_KEY, JSON.stringify(settledMonthsMap));
+    } catch {
+      // ignore
+    }
+  }, [settledMonthsMap]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(COLLAPSED_MONTHS_STORAGE_KEY, JSON.stringify(collapsedMonthsMap));
+    } catch {
+      // ignore
+    }
+  }, [collapsedMonthsMap]);
+
+  const settledMonthKeys = useMemo(() => {
+    return new Set<string>(settledMonthsMap[activeProfileId] || []);
+  }, [settledMonthsMap, activeProfileId]);
+
+  const collapsedMonthKeys = useMemo(() => {
+    return new Set<string>(collapsedMonthsMap[activeProfileId] || []);
+  }, [collapsedMonthsMap, activeProfileId]);
+
+  const handleToggleCollapseMonth = useCallback(
+    (monthKey: string) => {
+      setCollapsedMonthsMap((prev) => {
+        const current = new Set(prev[activeProfileId] || []);
+        if (current.has(monthKey)) {
+          current.delete(monthKey);
+        } else {
+          current.add(monthKey);
+        }
+        return {
+          ...prev,
+          [activeProfileId]: Array.from(current),
+        };
+      });
+    },
+    [activeProfileId]
+  );
+
+  const handleToggleSettleMonth = useCallback(
+    (monthKey: string, monthTitle: string) => {
+      const currentlySettled = (settledMonthsMap[activeProfileId] || []).includes(monthKey);
+
+      if (!currentlySettled) {
+        // Mark as settled AND automatically collapse this month
+        setSettledMonthsMap((prev) => {
+          const current = new Set(prev[activeProfileId] || []);
+          current.add(monthKey);
+          return { ...prev, [activeProfileId]: Array.from(current) };
+        });
+        setCollapsedMonthsMap((prev) => {
+          const current = new Set(prev[activeProfileId] || []);
+          current.add(monthKey);
+          return { ...prev, [activeProfileId]: Array.from(current) };
+        });
+        showToast(`Đã chốt sổ và thu gọn ${monthTitle}. Bấm "Mở rộng" bất cứ khi nào cần xem lại.`);
+      } else {
+        // Unsettle and expand
+        setSettledMonthsMap((prev) => {
+          const current = new Set(prev[activeProfileId] || []);
+          current.delete(monthKey);
+          return { ...prev, [activeProfileId]: Array.from(current) };
+        });
+        setCollapsedMonthsMap((prev) => {
+          const current = new Set(prev[activeProfileId] || []);
+          current.delete(monthKey);
+          return { ...prev, [activeProfileId]: Array.from(current) };
+        });
+        showToast(`Đã mở chốt và hiển thị lại chi tiết ${monthTitle}.`);
+      }
+    },
+    [settledMonthsMap, activeProfileId]
+  );
+
+  const handleCollapseAllSettled = useCallback(() => {
+    const settledList = settledMonthsMap[activeProfileId] || [];
+    if (settledList.length === 0) return;
+    setCollapsedMonthsMap((prev) => {
+      const current = new Set(prev[activeProfileId] || []);
+      settledList.forEach((mk) => current.add(mk));
+      return { ...prev, [activeProfileId]: Array.from(current) };
+    });
+    showToast('Đã thu gọn tất cả các tháng đã chốt sổ.');
+  }, [settledMonthsMap, activeProfileId]);
+
+  const handleCollapseAllMonths = useCallback(
+    (allMonthKeys: string[]) => {
+      setCollapsedMonthsMap((prev) => {
+        const current = new Set(prev[activeProfileId] || []);
+        allMonthKeys.forEach((mk) => current.add(mk));
+        return { ...prev, [activeProfileId]: Array.from(current) };
+      });
+    },
+    [activeProfileId]
+  );
+
+  const handleExpandAllMonths = useCallback(
+    (allMonthKeys: string[]) => {
+      setCollapsedMonthsMap((prev) => {
+        const current = new Set(prev[activeProfileId] || []);
+        allMonthKeys.forEach((mk) => current.delete(mk));
+        return { ...prev, [activeProfileId]: Array.from(current) };
+      });
+    },
+    [activeProfileId]
+  );
+
   // Modals state
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
@@ -123,20 +271,112 @@ export default function App() {
   const [activeReceiptExpense, setActiveReceiptExpense] = useState<ExpenseItem | null>(null);
 
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isPasteExcelModalOpen, setIsPasteExcelModalOpen] = useState(false);
+  const [initialPastePayload, setInitialPastePayload] =
+    useState<InitialClipboardPayload | null>(null);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
   const [isPDFExportModalOpen, setIsPDFExportModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
 
-  // Auto-backup state (Requirement 9)
+  const handleOpenPasteExcelModal = useCallback((payload?: InitialClipboardPayload) => {
+    if (payload) {
+      setInitialPastePayload(payload);
+    }
+    setIsPasteExcelModalOpen(true);
+  }, []);
+
+  // Requirement 1: Global paste listener on the main screen when no modal is open
+  useEffect(() => {
+    const anyModalOpen =
+      isExpenseModalOpen ||
+      isReceiptViewerOpen ||
+      isImportModalOpen ||
+      isPasteExcelModalOpen ||
+      isExportModalOpen ||
+      isBulkModalOpen ||
+      isPDFExportModalOpen ||
+      isSettingsModalOpen;
+
+    if (anyModalOpen || currentTab !== 'expenses') return;
+
+    const handleGlobalPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const clipboardData = e.clipboardData;
+      if (!clipboardData) return;
+
+      // Check image in clipboard
+      if (clipboardData.items) {
+        for (let i = 0; i < clipboardData.items.length; i++) {
+          const item = clipboardData.items[i];
+          if (item.type.startsWith('image/')) {
+            const blob = item.getAsFile();
+            if (blob) {
+              e.preventDefault();
+              handleOpenPasteExcelModal({
+                id: `global_img_${Date.now()}`,
+                imageBlob: blob,
+              });
+              return;
+            }
+          }
+        }
+      }
+
+      // Check Excel table in clipboard
+      const htmlText = clipboardData.getData('text/html') || '';
+      const plainText = clipboardData.getData('text/plain') || '';
+      if (isClipboardTableLike(plainText, htmlText)) {
+        e.preventDefault();
+        handleOpenPasteExcelModal({
+          id: `global_tbl_${Date.now()}`,
+          plainText,
+          htmlText,
+        });
+      }
+    };
+
+    window.addEventListener('paste', handleGlobalPaste);
+    return () => window.removeEventListener('paste', handleGlobalPaste);
+  }, [
+    currentTab,
+    isExpenseModalOpen,
+    isReceiptViewerOpen,
+    isImportModalOpen,
+    isPasteExcelModalOpen,
+    isExportModalOpen,
+    isBulkModalOpen,
+    isPDFExportModalOpen,
+    isSettingsModalOpen,
+    handleOpenPasteExcelModal,
+  ]);
+
+  // Auto-backup state (Requirement 5: JSON backup is now a contingency backup, disabled by default)
   const [autoBackupEnabled, setAutoBackupEnabled] = useState<boolean>(() => {
     try {
       const saved = localStorage.getItem(AUTO_BACKUP_STORAGE_KEY);
-      return saved === null ? true : saved === 'true';
+      return saved === null ? false : saved === 'true';
     } catch {
-      return true;
+      return false;
     }
   });
+  // Real-time Firestore Sync state (Requirements 1, 2, 3, 6, 8)
+  const [firebaseUid, setFirebaseUid] = useState<string | null>(null);
+  const [realtimeSyncStatus, setRealtimeSyncStatus] =
+    useState<RealtimeSyncStatus>('unauthenticated');
+  const [isNetworkOnline, setIsNetworkOnline] = useState<boolean>(
+    typeof navigator !== 'undefined' ? navigator.onLine : true
+  );
   const [lastBackupTime, setLastBackupTime] = useState<string | null>(() => {
     try {
       return localStorage.getItem(LAST_BACKUP_TIME_KEY);
@@ -510,7 +750,7 @@ export default function App() {
     const unsubscribe = initAuth(
       (user, token, isFromRedirect) => {
         setDriveUser(user);
-        setHasActiveToken(true);
+        setHasActiveToken(Boolean(token));
         setNeedsReauth(false);
         setDriveError(null);
 
@@ -523,7 +763,7 @@ export default function App() {
         if (userWithoutToken) {
           setDriveUser(userWithoutToken);
           setHasActiveToken(false);
-          setNeedsReauth(true);
+          setNeedsReauth(false);
         } else {
           setDriveUser(null);
           setHasActiveToken(false);
@@ -540,6 +780,75 @@ export default function App() {
     );
     return () => unsubscribe();
   }, [handlePostAuthDriveSync]);
+
+  // Listen to online/offline network status for Requirement 8 corner indicator
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsNetworkOnline(true);
+      if (firebaseUid) {
+        setRealtimeSyncStatus('synced');
+      }
+    };
+    const handleOffline = () => {
+      setIsNetworkOnline(false);
+      setRealtimeSyncStatus('offline');
+    };
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [firebaseUid]);
+
+  // Requirement 1, 2, 3, 6: Listen to Firebase Auth UID and subscribe to real-time Firestore `users/{uid}/expenses`
+  useEffect(() => {
+    const auth = getFirebaseAuthInstance();
+    let unsubscribeSnapshot: (() => void) | null = null;
+
+    let isCancelled = false;
+    const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
+
+      if (user && user.uid) {
+        try {
+          await user.getIdToken();
+        } catch {
+          // Proceed with cached auth state if offline
+        }
+        if (isCancelled) return;
+
+        setFirebaseUid(user.uid);
+        ensureRootUserDocument(user).catch(() => {});
+
+        unsubscribeSnapshot = subscribeToUserExpensesRealtime(
+          user.uid,
+          () => latestDataRef.current.expenses,
+          (mergedExpenses) => {
+            setExpenses(mergedExpenses);
+            replaceAllExpenses(mergedExpenses).catch(() => {});
+          },
+          (status) => {
+            setRealtimeSyncStatus(status);
+          }
+        );
+      } else {
+        setFirebaseUid(null);
+        setRealtimeSyncStatus(navigator.onLine ? 'unauthenticated' : 'offline');
+      }
+    });
+
+    return () => {
+      isCancelled = true;
+      unsubscribeAuth();
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+      }
+    };
+  }, []);
 
   // Save current UI context right before Redirect Auth navigates away (Requirement 5)
   const saveCurrentContextBeforeRedirect = useCallback(() => {
@@ -600,10 +909,15 @@ export default function App() {
       if (!result) return;
 
       setDriveUser(result.user);
-      setHasActiveToken(true);
+      setHasActiveToken(Boolean(result.accessToken));
       setNeedsReauth(false);
+      showToast(
+        `Đã kết nối tài khoản Google (${result.user.email || result.user.displayName}) & bật đồng bộ thời gian thực!`
+      );
 
-      await handlePostAuthDriveSync(result.accessToken, pendingRetryAfterReauthRef.current);
+      if (result.accessToken) {
+        await handlePostAuthDriveSync(result.accessToken, pendingRetryAfterReauthRef.current);
+      }
     } catch (err: any) {
       setDriveSyncStatus('error');
       const syncErr: DriveSyncError =
@@ -1016,6 +1330,14 @@ export default function App() {
       setExpenses(nextList);
       setSelectedExpenseIds(new Set());
       showToast(`Đã xóa hàng loạt ${idsToDelete.length} khoản chi!`);
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        deleteExpensesBulkFromFirestore(firebaseUid, idsToDelete)
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err) {
       showToast('Lỗi khi xóa hàng loạt.');
@@ -1051,6 +1373,14 @@ export default function App() {
       setExpenses(updatedList);
       setSelectedExpenseIds(new Set());
       showToast(`Đã đổi ngày cho ${idsToUpdate.size} khoản chi thành ${newDate}!`);
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        syncExpensesBulkToFirestore(firebaseUid, itemsToSave)
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(updatedList);
     } catch (err) {
       showToast('Lỗi khi đổi ngày hàng loạt.');
@@ -1142,6 +1472,7 @@ export default function App() {
         profileId:
           savedItem.profileId ||
           (activeProfileId !== 'all' ? activeProfileId : 'default'),
+        updatedAt: Date.now(),
       };
       await saveExpense(itemWithProfile);
 
@@ -1155,6 +1486,16 @@ export default function App() {
       });
 
       showToast(editingExpense ? 'Đã cập nhật khoản chi!' : 'Đã thêm khoản chi mới!');
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        syncExpenseToFirestore(firebaseUid, itemWithProfile, (updatedWithUrls) => {
+          saveExpense(updatedWithUrls).catch(() => {});
+        })
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err: any) {
       console.error('Error saving expense:', err);
@@ -1162,7 +1503,7 @@ export default function App() {
     }
   };
 
-  // Action: Add Bulk Expenses from Message (Requirement 6)
+  // Action: Add Bulk Expenses from Message / Paste Excel
   const handleConfirmAddBulk = async (bulkItems: ExpenseItem[]) => {
     try {
       await saveExpensesBulk(bulkItems);
@@ -1171,7 +1512,15 @@ export default function App() {
         nextList = [...bulkItems, ...prev];
         return nextList;
       });
-      showToast(`Đã tách và thêm ${bulkItems.length} khoản chi từ tin nhắn!`);
+      showToast(`Đã tách và thêm ${bulkItems.length} khoản chi!`);
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        syncExpensesBulkToFirestore(firebaseUid, bulkItems)
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err: any) {
       console.error('Error adding bulk expenses:', err);
@@ -1189,6 +1538,14 @@ export default function App() {
         return nextList;
       });
       showToast('Đã xóa khoản chi thành công.');
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        deleteExpenseFromFirestore(firebaseUid, id)
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err) {
       console.error('Error deleting expense:', err);
@@ -1216,6 +1573,16 @@ export default function App() {
       });
       setActiveReceiptExpense(updated);
       showToast('Đã cập nhật ảnh chứng từ!');
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        syncExpenseToFirestore(firebaseUid, updated, (updatedWithUrls) => {
+          saveExpense(updatedWithUrls).catch(() => {});
+        })
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err: any) {
       console.error('Error updating images:', err);
@@ -1260,6 +1627,14 @@ export default function App() {
       });
       setActiveReceiptExpense(updated);
       showToast('Đã cập nhật thông tin khoản chi từ hóa đơn AI!');
+      if (firebaseUid) {
+        setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+        syncExpenseToFirestore(firebaseUid, updated)
+          .then(() => {
+            if (navigator.onLine) setRealtimeSyncStatus('synced');
+          })
+          .catch(() => {});
+      }
       scheduleAutoBackup(nextList);
     } catch (err: any) {
       console.error('Error applying receipt OCR:', err);
@@ -1378,11 +1753,21 @@ export default function App() {
       }));
 
       if (mode === 'replace') {
+        const oldIds = expenses.map((e) => e.id);
         const saved = await replaceAllExpenses(itemsWithProfile);
         setExpenses(saved);
         setSelectedMonth('all');
         setSearchTerm('');
         showToast(`Đã thay thế toàn bộ bằng ${saved.length} khoản chi mới!`);
+        if (firebaseUid) {
+          setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+          deleteExpensesBulkFromFirestore(firebaseUid, oldIds)
+            .then(() => syncExpensesBulkToFirestore(firebaseUid, saved))
+            .then(() => {
+              if (navigator.onLine) setRealtimeSyncStatus('synced');
+            })
+            .catch(() => {});
+        }
         scheduleAutoBackup(saved);
       } else {
         await saveExpensesBulk(itemsWithProfile);
@@ -1393,6 +1778,14 @@ export default function App() {
         });
         setSelectedMonth('all');
         showToast(`Đã gộp thêm ${itemsWithProfile.length} khoản chi từ Excel!`);
+        if (firebaseUid) {
+          setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+          syncExpensesBulkToFirestore(firebaseUid, itemsWithProfile)
+            .then(() => {
+              if (navigator.onLine) setRealtimeSyncStatus('synced');
+            })
+            .catch(() => {});
+        }
         scheduleAutoBackup(nextList);
       }
     } catch (err: any) {
@@ -1456,6 +1849,15 @@ export default function App() {
       `Đã khôi phục thành công ${finalList.length} khoản chi và ${totalImages} ảnh chứng từ!`
     );
 
+    if (firebaseUid) {
+      setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+      syncExpensesBulkToFirestore(firebaseUid, finalList)
+        .then(() => {
+          if (navigator.onLine) setRealtimeSyncStatus('synced');
+        })
+        .catch(() => {});
+    }
+
     return {
       totalExpenses: finalList.length,
       totalImages,
@@ -1464,6 +1866,7 @@ export default function App() {
 
   // Action: Clear All Data
   const handleClearAllData = async (): Promise<void> => {
+    const oldIds = expenses.map((e) => e.id);
     await clearAllExpenses();
     await replaceAllAdvances([]);
     setExpenses([]);
@@ -1472,6 +1875,14 @@ export default function App() {
     setSearchTerm('');
     setOnlyMissingReceipts(false);
     setActiveReceiptExpense(null);
+    if (firebaseUid && oldIds.length > 0) {
+      setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
+      deleteExpensesBulkFromFirestore(firebaseUid, oldIds)
+        .then(() => {
+          if (navigator.onLine) setRealtimeSyncStatus('synced');
+        })
+        .catch(() => {});
+    }
     showToast('Đã xóa toàn bộ dữ liệu chi tiêu hiện tại.');
   };
 
@@ -1479,6 +1890,45 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 flex flex-col selection:bg-teal-100 selection:text-teal-900 pb-20 sm:pb-12">
       {/* Requirement 10: PWA Install & Offline Status Banner */}
       <PWAInstallBanner />
+
+      {/* Requirement 8: Small Real-Time Sync Status Indicator at the Corner of the App */}
+      <div className="fixed bottom-16 sm:bottom-4 left-3 sm:left-4 z-40 pointer-events-auto">
+        {!isNetworkOnline || realtimeSyncStatus === 'offline' ? (
+          <div
+            title="Thiết bị đang mất kết nối mạng. Mọi thay đổi được lưu vào bộ nhớ đệm (IndexedDB) và sẽ tự đẩy lên Firestore khi có mạng lại."
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-rose-300 shadow-md text-[11px] font-semibold text-rose-900"
+          >
+            <span className="w-2.5 h-2.5 rounded-full bg-rose-500 shrink-0" />
+            <span>Mất mạng - sẽ đồng bộ lại khi có mạng</span>
+          </div>
+        ) : realtimeSyncStatus === 'syncing' ? (
+          <div
+            title="Đang đồng bộ dữ liệu thời gian thực lên Firebase Firestore..."
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-amber-300 shadow-md text-[11px] font-semibold text-amber-900"
+          >
+            <span className="w-2.5 h-2.5 rounded-full bg-amber-500 animate-pulse shrink-0" />
+            <span>Đang đồng bộ...</span>
+          </div>
+        ) : firebaseUid ? (
+          <div
+            title="Dữ liệu đã được đồng bộ thời gian thực trên Firebase Firestore"
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-emerald-200 shadow-md text-[11px] font-semibold text-emerald-900"
+          >
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0" />
+            <span>Đã đồng bộ</span>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={handleGoogleLogin}
+            title="Bấm để đăng nhập Google và bật đồng bộ thời gian thực giữa điện thoại & máy tính"
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-slate-200 hover:border-teal-300 shadow-md text-[11px] font-semibold text-slate-700 hover:text-teal-900 transition-colors cursor-pointer"
+          >
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0" />
+            <span>Đã đồng bộ (Lưu nội bộ • Bấm để đồng bộ Cloud)</span>
+          </button>
+        )}
+      </div>
 
       {/* Toast Notification */}
       {toastMessage && (
@@ -1496,6 +1946,7 @@ export default function App() {
         setViewMode={setViewMode}
         onOpenAddModal={() => handleOpenAddModal()}
         onOpenImportModal={() => setIsImportModalOpen(true)}
+        onOpenPasteExcelModal={() => handleOpenPasteExcelModal()}
         onOpenExportModal={() => setIsExportModalOpen(true)}
         onOpenBulkModal={() => setIsBulkModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
@@ -1527,8 +1978,9 @@ export default function App() {
 
       {/* Main Content Body */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-3 sm:px-6 py-5">
-        {/* Requirement 9: Auto Backup & Google Drive Sync Status Bar */}
+        {/* Requirement 9: Auto Backup & Real-Time Firestore Sync Status Bar */}
         <AutoBackupBar
+          realtimeSyncStatus={realtimeSyncStatus}
           autoBackupEnabled={autoBackupEnabled}
           onToggleAutoBackup={handleToggleAutoBackup}
           lastBackupTime={lastBackupTime}
@@ -1588,6 +2040,7 @@ export default function App() {
               existingExpenses={expenses}
               activeProfileId={activeProfileId !== 'all' ? activeProfileId : 'default'}
               onOpenBulkMessageModal={() => setIsBulkModalOpen(true)}
+              onOpenPasteExcelModal={handleOpenPasteExcelModal}
             />
 
             {/* Requirement 8: Batch Operations Floating / Sticky Bar */}
@@ -1625,6 +2078,17 @@ export default function App() {
                   filteredExpenses.length > 0 &&
                   selectedExpenseIds.size === filteredExpenses.length
                 }
+                settledMonthKeys={settledMonthKeys}
+                collapsedMonthKeys={collapsedMonthKeys}
+                onToggleCollapseMonth={handleToggleCollapseMonth}
+                onToggleSettleMonth={handleToggleSettleMonth}
+                onCollapseAllSettled={handleCollapseAllSettled}
+                onCollapseAllMonths={() =>
+                  handleCollapseAllMonths(monthGroups.map((g) => g.monthKey))
+                }
+                onExpandAllMonths={() =>
+                  handleExpandAllMonths(monthGroups.map((g) => g.monthKey))
+                }
               />
             ) : (
               <CardView
@@ -1640,6 +2104,17 @@ export default function App() {
                 totalExpensesCount={filteredExpenses.length}
                 selectedIds={selectedExpenseIds}
                 onToggleSelect={handleToggleSelect}
+                settledMonthKeys={settledMonthKeys}
+                collapsedMonthKeys={collapsedMonthKeys}
+                onToggleCollapseMonth={handleToggleCollapseMonth}
+                onToggleSettleMonth={handleToggleSettleMonth}
+                onCollapseAllSettled={handleCollapseAllSettled}
+                onCollapseAllMonths={() =>
+                  handleCollapseAllMonths(monthGroups.map((g) => g.monthKey))
+                }
+                onExpandAllMonths={() =>
+                  handleExpandAllMonths(monthGroups.map((g) => g.monthKey))
+                }
               />
             )}
           </>
@@ -1685,6 +2160,14 @@ export default function App() {
         >
           <BarChart3 size={18} />
           <span className="mt-0.5">Thống kê</span>
+        </button>
+
+        <button
+          onClick={() => handleOpenPasteExcelModal()}
+          className="min-h-[44px] flex flex-col items-center justify-center py-1 px-2 rounded-lg text-[10px] font-semibold text-slate-400 hover:text-slate-700 transition-colors"
+        >
+          <ClipboardPaste size={18} />
+          <span className="mt-0.5">Dán Excel</span>
         </button>
 
         <button
@@ -1742,6 +2225,21 @@ export default function App() {
         }
         activeProfileId={activeProfileId !== 'all' ? activeProfileId : 'default'}
         onConfirmAddBulk={handleConfirmAddBulk}
+      />
+
+      <PasteExcelModal
+        isOpen={isPasteExcelModalOpen}
+        onClose={() => setIsPasteExcelModalOpen(false)}
+        existingExpenses={expenses}
+        defaultMonth={
+          availableMonths.length > 0
+            ? availableMonths[availableMonths.length - 1]
+            : 'Tháng 4'
+        }
+        activeProfileId={activeProfileId !== 'all' ? activeProfileId : 'default'}
+        onConfirmAddBulk={handleConfirmAddBulk}
+        initialPayload={initialPastePayload}
+        onClearInitialPayload={() => setInitialPastePayload(null)}
       />
 
       <ImportExcelModal

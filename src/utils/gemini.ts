@@ -688,6 +688,172 @@ export async function parseBulkExpenses(
 }
 
 /**
+ * Parse a pasted Excel table image using Gemini Vision
+ */
+export async function parseExcelImageWithAI(
+  imageBase64: string,
+  options?: {
+    mimeType?: string;
+    defaultMonthNum?: number;
+    defaultYear?: number;
+    unitMode?: 'thousand' | 'vnd' | 'auto_k';
+  }
+): Promise<{
+  success: boolean;
+  data: NaturalExpenseParsed[];
+  error?: string;
+  needApiKey?: boolean;
+}> {
+  if (!imageBase64) {
+    return {
+      success: false,
+      data: [],
+      error: 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+    };
+  }
+
+  if (typeof navigator !== 'undefined' && !navigator.onLine) {
+    return {
+      success: false,
+      data: [],
+      error: 'Thiết bị đang ngoại tuyến. Cần kết nối mạng để dùng Gemini đọc bảng từ hình ảnh, hoặc bạn có thể dán dạng văn bản từ Excel.',
+    };
+  }
+
+  const userKey = getUserApiKey();
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (userKey) {
+    headers['x-gemini-api-key'] = userKey;
+  }
+
+  const mimeType = options?.mimeType || 'image/png';
+  const defaultMonthNum = options?.defaultMonthNum || new Date().getMonth() + 1;
+  const defaultYear = options?.defaultYear || new Date().getFullYear();
+  const unitMode = options?.unitMode || 'thousand';
+
+  try {
+    const res = await fetch('/api/parse-excel-image', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        imageBase64,
+        mimeType,
+        defaultMonthNum,
+        defaultYear,
+        unitMode,
+      }),
+    });
+
+    if (res.status === 401) {
+      return {
+        success: false,
+        data: [],
+        error: 'Chưa cấu hình khóa Gemini API. Vui lòng vào Cài đặt (biểu tượng bánh răng) để thêm khóa API của riêng bạn.',
+        needApiKey: true,
+      };
+    }
+
+    if (res.ok) {
+      const json = await res.json();
+      if (json.success && Array.isArray(json.data)) {
+        const cleaned: NaturalExpenseParsed[] = json.data
+          .map((item: any) => ({
+            ngay: String(item.ngay || '').trim(),
+            so_tien: Number(item.so_tien) || 0,
+            dien_giai: String(item.dien_giai || '').trim(),
+            isFallback: false,
+          }))
+          .filter((item: NaturalExpenseParsed) => item.so_tien !== 0 && item.dien_giai.length > 0);
+
+        if (cleaned.length > 0) {
+          return {
+            success: true,
+            data: cleaned,
+          };
+        }
+        return {
+          success: false,
+          data: [],
+          error: 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+        };
+      }
+    }
+  } catch (netErr) {
+    console.warn('Server proxy unavailable for parse-excel-image, checking client SDK...', netErr);
+  }
+
+  // Fallback to direct client SDK if userKey is configured (e.g. Android APK standalone)
+  if (userKey) {
+    try {
+      const ai = new GoogleGenAI({ apiKey: userKey });
+      const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+
+      const promptText = `
+Đọc hình ảnh bảng Excel chi tiêu này và trích xuất từng dòng chi tiêu:
+1. Nếu có dòng mốc tháng ("t1".."t12", "T 3", "Tháng 3") thì các dòng dưới thuộc tháng đó. Nếu không có mốc tháng, dùng Tháng ${String(defaultMonthNum).padStart(2, '0')}/${defaultYear}.
+2. Ô Ngày trống thì lấy theo ngày gần nhất phía trên (forward-fill). Định dạng "ngay" là "DD/MM/YYYY".
+3. "so_tien": số nguyên VNĐ (${unitMode === 'vnd' ? 'giữ nguyên số' : 'nhân 1000 nếu số nhỏ ghi theo nghìn đồng, giữ dấu âm nếu số âm'}).
+4. "dien_giai": nội dung chi tiêu. Bỏ qua dòng tiêu đề và dòng Tổng cộng.
+`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: {
+          parts: [
+            { inlineData: { data: cleanBase64, mimeType } },
+            { text: promptText },
+          ],
+        },
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                ngay: { type: Type.STRING },
+                so_tien: { type: Type.NUMBER },
+                dien_giai: { type: Type.STRING },
+              },
+              required: ['ngay', 'so_tien', 'dien_giai'],
+            },
+          },
+        },
+      });
+
+      const parsed = JSON.parse(response.text?.trim() || '[]');
+      if (Array.isArray(parsed)) {
+        const cleaned: NaturalExpenseParsed[] = parsed
+          .map((item: any) => ({
+            ngay: String(item.ngay || '').trim(),
+            so_tien: Number(item.so_tien) || 0,
+            dien_giai: String(item.dien_giai || '').trim(),
+            isFallback: false,
+          }))
+          .filter((item: NaturalExpenseParsed) => item.so_tien !== 0 && item.dien_giai.length > 0);
+
+        if (cleaned.length > 0) {
+          return {
+            success: true,
+            data: cleaned,
+          };
+        }
+      }
+    } catch (err) {
+      console.warn('Client SDK parseExcelImageWithAI failed:', err);
+    }
+  }
+
+  return {
+    success: false,
+    data: [],
+    error: 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+  };
+}
+
+/**
  * Requirement 8: Summarize spending & advance payment balance in natural Vietnamese
  */
 export async function summarizeExpensesWithAI(summaryPayload: any): Promise<{

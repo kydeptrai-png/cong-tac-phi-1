@@ -46,23 +46,43 @@ let cachedFonts: { regular: ArrayBuffer; bold: ArrayBuffer } | null = null;
 async function loadUnicodeFonts(): Promise<{ regular: ArrayBuffer; bold: ArrayBuffer }> {
   if (cachedFonts) return cachedFonts;
 
-  // Primary source: local public/fonts/ served by Vite/Express
-  try {
-    const [regRes, boldRes] = await Promise.all([
-      fetch('/fonts/Roboto-Regular.ttf'),
-      fetch('/fonts/Roboto-Bold.ttf'),
-    ]);
+  const CACHE_NAME = 'so-chi-tieu-pdf-fonts-v1';
 
-    if (regRes.ok && boldRes.ok) {
-      const [regular, bold] = await Promise.all([
-        regRes.arrayBuffer(),
-        boldRes.arrayBuffer(),
-      ]);
-      // Verify minimum valid font file size (> 50KB)
-      if (regular.byteLength > 50000 && bold.byteLength > 50000) {
-        cachedFonts = { regular, bold };
-        return cachedFonts;
+  // Helper to fetch and persist in CacheStorage for offline support
+  const fetchWithCache = async (url: string): Promise<ArrayBuffer> => {
+    if (typeof caches !== 'undefined') {
+      try {
+        const cache = await caches.open(CACHE_NAME);
+        const cachedRes = await cache.match(url);
+        if (cachedRes && cachedRes.ok) {
+          const buf = await cachedRes.arrayBuffer();
+          if (buf.byteLength > 50000) return buf;
+        }
+        const netRes = await fetch(url);
+        if (netRes.ok) {
+          await cache.put(url, netRes.clone());
+          return await netRes.arrayBuffer();
+        }
+      } catch {
+        // Fallback to direct fetch below
       }
+    }
+    const directRes = await fetch(url);
+    if (!directRes.ok) {
+      throw new Error(`HTTP ${directRes.status}`);
+    }
+    return await directRes.arrayBuffer();
+  };
+
+  // Primary source: server proxy /fonts/
+  try {
+    const [regular, bold] = await Promise.all([
+      fetchWithCache('/fonts/Roboto-Regular.ttf'),
+      fetchWithCache('/fonts/Roboto-Bold.ttf'),
+    ]);
+    if (regular.byteLength > 50000 && bold.byteLength > 50000) {
+      cachedFonts = { regular, bold };
+      return cachedFonts;
     }
   } catch (err) {
     console.warn('Local font fetch failed, falling back to CDN...', err);
@@ -70,18 +90,9 @@ async function loadUnicodeFonts(): Promise<{ regular: ArrayBuffer; bold: ArrayBu
 
   // Fallback source: high-availability CDN with complete Unicode Vietnamese support
   try {
-    const [regRes, boldRes] = await Promise.all([
-      fetch('https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Regular.ttf'),
-      fetch('https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Medium.ttf'),
-    ]);
-
-    if (!regRes.ok || !boldRes.ok) {
-      throw new Error(`Mã lỗi HTTP: Regular=${regRes.status}, Bold=${boldRes.status}`);
-    }
-
     const [regular, bold] = await Promise.all([
-      regRes.arrayBuffer(),
-      boldRes.arrayBuffer(),
+      fetchWithCache('https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Regular.ttf'),
+      fetchWithCache('https://cdn.jsdelivr.net/npm/pdfmake@0.2.18/build/fonts/Roboto/Roboto-Medium.ttf'),
     ]);
 
     cachedFonts = { regular, bold };
