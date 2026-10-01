@@ -10,6 +10,10 @@ import {
   ClipboardPaste,
   Settings,
   RefreshCw,
+  ImagePlus,
+  X,
+  Search,
+  Sparkles,
 } from 'lucide-react';
 import {
   ExpenseItem,
@@ -50,7 +54,8 @@ import {
   isClipboardTableLike,
 } from './utils/excel';
 import { exportExpensesToPDF } from './utils/pdfExport';
-import { removeVietnameseAccents } from './utils/categories';
+import { removeVietnameseAccents, formatVND } from './utils/categories';
+import { compressImage } from './utils/gemini';
 import { Header } from './components/Header';
 import { TableView } from './components/TableView';
 import { CardView } from './components/CardView';
@@ -69,6 +74,17 @@ import { PWAInstallBanner } from './components/PWAInstallBanner';
 import { PDFExportModal } from './components/PDFExportModal';
 import { SettingsModal } from './components/SettingsModal';
 import { DriveSyncModal } from './components/DriveSyncModal';
+import { LanSyncModal } from './components/LanSyncModal';
+import {
+  LanSyncManager,
+  LanSyncConnectionState,
+  LanPeerInfo,
+  LanActivityLogItem,
+  LanSyncPayload,
+  getSavedRoomCode,
+  getAutoJoinLanRoom,
+  detectDeviceInfo,
+} from './utils/lanSync';
 import {
   GoogleDriveUser,
   DriveBackupMetadata,
@@ -268,9 +284,22 @@ export default function App() {
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
   const [editingExpense, setEditingExpense] = useState<ExpenseItem | null>(null);
   const [defaultMonthForNew, setDefaultMonthForNew] = useState<string>('Tháng 4');
+  const [initialModalImages, setInitialModalImages] = useState<string[] | null>(null);
 
   const [isReceiptViewerOpen, setIsReceiptViewerOpen] = useState(false);
   const [activeReceiptExpense, setActiveReceiptExpense] = useState<ExpenseItem | null>(null);
+
+  // Outside drag-and-drop & hover paste states
+  const [uploadingExpenseId, setUploadingExpenseId] = useState<string | null>(null);
+  const hoveredExpenseIdRef = useRef<string | null>(null);
+  const [isGlobalDraggingFiles, setIsGlobalDraggingFiles] = useState<boolean>(false);
+  const globalDragDepthRef = useRef<number>(0);
+  const [droppedOutsidePayload, setDroppedOutsidePayload] = useState<{
+    images: string[];
+    rawFiles: File[];
+  } | null>(null);
+  const [droppedOutsideSearch, setDroppedOutsideSearch] = useState<string>('');
+  const [droppedOutsideFilter, setDroppedOutsideFilter] = useState<'missing' | 'all'>('missing');
 
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isPasteExcelModalOpen, setIsPasteExcelModalOpen] = useState(false);
@@ -280,6 +309,15 @@ export default function App() {
   const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
   const [isPDFExportModalOpen, setIsPDFExportModalOpen] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isLanSyncModalOpen, setIsLanSyncModalOpen] = useState(false);
+
+  // Real-time LAN / P2P Sync state
+  const [lanStatus, setLanStatus] = useState<LanSyncConnectionState>('disconnected');
+  const [lanRoomCode, setLanRoomCode] = useState<string>('');
+  const [lanDeviceName, setLanDeviceName] = useState<string>(() => detectDeviceInfo().deviceName);
+  const [lanPeers, setLanPeers] = useState<LanPeerInfo[]>([]);
+  const [lanActivityLogs, setLanActivityLogs] = useState<LanActivityLogItem[]>([]);
+  const lanManagerRef = useRef<LanSyncManager | null>(null);
 
   const handleOpenPasteExcelModal = useCallback((payload?: InitialClipboardPayload) => {
     if (payload) {
@@ -288,7 +326,7 @@ export default function App() {
     setIsPasteExcelModalOpen(true);
   }, []);
 
-  // Requirement 1: Global paste listener on the main screen when no modal is open
+  // Requirement 1: Global paste & global drag-and-drop listeners on the main screen when no modal is open
   useEffect(() => {
     const anyModalOpen =
       isExpenseModalOpen ||
@@ -298,11 +336,17 @@ export default function App() {
       isExportModalOpen ||
       isBulkModalOpen ||
       isPDFExportModalOpen ||
-      isSettingsModalOpen;
+      isSettingsModalOpen ||
+      isLanSyncModalOpen ||
+      Boolean(droppedOutsidePayload);
 
-    if (anyModalOpen || currentTab !== 'expenses') return;
+    if (anyModalOpen || currentTab !== 'expenses') {
+      setIsGlobalDraggingFiles(false);
+      globalDragDepthRef.current = 0;
+      return;
+    }
 
-    const handleGlobalPaste = (e: ClipboardEvent) => {
+    const handleGlobalPaste = async (e: ClipboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -325,6 +369,43 @@ export default function App() {
             const blob = item.getAsFile();
             if (blob) {
               e.preventDefault();
+              // If user is hovering over a specific expense row/card, attach screenshot directly to that expense!
+              const hoveredId = hoveredExpenseIdRef.current;
+              if (hoveredId) {
+                const targetExpense = latestDataRef.current.expenses.find(
+                  (exp) => exp.id === hoveredId
+                );
+                if (targetExpense) {
+                  setUploadingExpenseId(targetExpense.id);
+                  try {
+                    const compressed = await compressImage(blob, 1280, 0.7);
+                    const updatedImages = [...(targetExpense.images || []), compressed];
+                    const updatedExpense: ExpenseItem = {
+                      ...targetExpense,
+                      images: updatedImages,
+                      updatedAt: Date.now(),
+                    };
+                    await saveExpense(updatedExpense);
+                    setExpenses((prev) =>
+                      prev.map((it) => (it.id === targetExpense.id ? updatedExpense : it))
+                    );
+                    lanManagerRef.current?.broadcastData({
+                      action: 'sync:expense_upsert',
+                      expense: updatedExpense,
+                      timestamp: Date.now(),
+                    });
+                    showToast(
+                      `Đã dán ảnh chụp màn hình vào khoản "${targetExpense.description}"!`
+                    );
+                  } catch (err) {
+                    console.error('Error pasting image to hovered expense:', err);
+                  } finally {
+                    setUploadingExpenseId(null);
+                  }
+                  return;
+                }
+              }
+
               handleOpenPasteExcelModal({
                 id: `global_img_${Date.now()}`,
                 imageBlob: blob,
@@ -348,8 +429,108 @@ export default function App() {
       }
     };
 
+    const hasImageFilesInDrag = (dt: DataTransfer | null): boolean => {
+      if (!dt) return false;
+      if (dt.types && Array.from(dt.types).includes('Files')) {
+        return true;
+      }
+      return false;
+    };
+
+    const extractImageFiles = (dt: DataTransfer | null): File[] => {
+      if (!dt) return [];
+      const files: File[] = [];
+      if (dt.files && dt.files.length > 0) {
+        for (let i = 0; i < dt.files.length; i++) {
+          const f = dt.files[i];
+          if (f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|heic)$/i.test(f.name)) {
+            files.push(f);
+          }
+        }
+      }
+      if (files.length === 0 && dt.items && dt.items.length > 0) {
+        for (let i = 0; i < dt.items.length; i++) {
+          const item = dt.items[i];
+          if (item.kind === 'file' && item.type.startsWith('image/')) {
+            const f = item.getAsFile();
+            if (f) files.push(f);
+          }
+        }
+      }
+      return files;
+    };
+
+    const handleWindowDragEnter = (e: DragEvent) => {
+      if (!hasImageFilesInDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      globalDragDepthRef.current += 1;
+      setIsGlobalDraggingFiles(true);
+    };
+
+    const handleWindowDragOver = (e: DragEvent) => {
+      if (!hasImageFilesInDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'copy';
+      }
+      if (!isGlobalDraggingFiles) {
+        setIsGlobalDraggingFiles(true);
+      }
+    };
+
+    const handleWindowDragLeave = (e: DragEvent) => {
+      if (!hasImageFilesInDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      globalDragDepthRef.current = Math.max(0, globalDragDepthRef.current - 1);
+      if (globalDragDepthRef.current === 0 || (e.clientX === 0 && e.clientY === 0)) {
+        globalDragDepthRef.current = 0;
+        setIsGlobalDraggingFiles(false);
+      }
+    };
+
+    const handleWindowDrop = async (e: DragEvent) => {
+      globalDragDepthRef.current = 0;
+      setIsGlobalDraggingFiles(false);
+
+      const files = extractImageFiles(e.dataTransfer);
+      if (files.length === 0) return;
+
+      e.preventDefault();
+      const compressedList: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const compressed = await compressImage(files[i], 1280, 0.7);
+          compressedList.push(compressed);
+        } catch (err) {
+          console.error('Error compressing globally dropped image:', err);
+        }
+      }
+
+      if (compressedList.length > 0) {
+        const hasMissing = latestDataRef.current.expenses.some(
+          (it) => !it.images || it.images.length === 0
+        );
+        setDroppedOutsideFilter(hasMissing ? 'missing' : 'all');
+        setDroppedOutsideSearch('');
+        setDroppedOutsidePayload({
+          images: compressedList,
+          rawFiles: files,
+        });
+      }
+    };
+
     window.addEventListener('paste', handleGlobalPaste);
-    return () => window.removeEventListener('paste', handleGlobalPaste);
+    window.addEventListener('dragenter', handleWindowDragEnter);
+    window.addEventListener('dragover', handleWindowDragOver);
+    window.addEventListener('dragleave', handleWindowDragLeave);
+    window.addEventListener('drop', handleWindowDrop);
+    return () => {
+      window.removeEventListener('paste', handleGlobalPaste);
+      window.removeEventListener('dragenter', handleWindowDragEnter);
+      window.removeEventListener('dragover', handleWindowDragOver);
+      window.removeEventListener('dragleave', handleWindowDragLeave);
+      window.removeEventListener('drop', handleWindowDrop);
+    };
   }, [
     currentTab,
     isExpenseModalOpen,
@@ -360,6 +541,9 @@ export default function App() {
     isBulkModalOpen,
     isPDFExportModalOpen,
     isSettingsModalOpen,
+    isLanSyncModalOpen,
+    droppedOutsidePayload,
+    isGlobalDraggingFiles,
     handleOpenPasteExcelModal,
   ]);
 
@@ -1096,6 +1280,7 @@ export default function App() {
   // Requirement 7: Android Hardware / Gesture Back Button Handling
   // When any modal is open, pressing Back closes the top modal instead of exiting the app.
   const isAnyModalOpen =
+    isLanSyncModalOpen ||
     driveSyncModalState.isOpen ||
     isSettingsModalOpen ||
     isExpenseModalOpen ||
@@ -1106,6 +1291,10 @@ export default function App() {
     isPDFExportModalOpen;
 
   const closeTopModal = useCallback((): boolean => {
+    if (isLanSyncModalOpen) {
+      setIsLanSyncModalOpen(false);
+      return true;
+    }
     if (driveSyncModalState.isOpen) {
       setDriveSyncModalState((prev) => ({ ...prev, isOpen: false }));
       return true;
@@ -1141,6 +1330,7 @@ export default function App() {
     }
     return false;
   }, [
+    isLanSyncModalOpen,
     driveSyncModalState.isOpen,
     isSettingsModalOpen,
     isReceiptViewerOpen,
@@ -1358,6 +1548,11 @@ export default function App() {
       setExpenses(nextList);
       setSelectedExpenseIds(new Set());
       showToast(`Đã xóa hàng loạt ${idsToDelete.length} khoản chi!`);
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expenses_bulk_delete',
+        expenseIds: idsToDelete,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         deleteExpensesBulkFromFirestore(firebaseUid, idsToDelete)
@@ -1401,6 +1596,11 @@ export default function App() {
       setExpenses(updatedList);
       setSelectedExpenseIds(new Set());
       showToast(`Đã đổi ngày cho ${idsToUpdate.size} khoản chi thành ${newDate}!`);
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expenses_bulk_upsert',
+        expenses: itemsToSave,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         syncExpensesBulkToFirestore(firebaseUid, itemsToSave)
@@ -1514,6 +1714,11 @@ export default function App() {
       });
 
       showToast(editingExpense ? 'Đã cập nhật khoản chi!' : 'Đã thêm khoản chi mới!');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expense_upsert',
+        expense: itemWithProfile,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         syncExpenseToFirestore(firebaseUid, itemWithProfile, (updatedWithUrls) => {
@@ -1541,6 +1746,11 @@ export default function App() {
         return nextList;
       });
       showToast(`Đã tách và thêm ${bulkItems.length} khoản chi!`);
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expenses_bulk_upsert',
+        expenses: bulkItems,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         syncExpensesBulkToFirestore(firebaseUid, bulkItems)
@@ -1566,6 +1776,11 @@ export default function App() {
         return nextList;
       });
       showToast('Đã xóa khoản chi thành công.');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expense_delete',
+        expenseId: id,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         deleteExpenseFromFirestore(firebaseUid, id)
@@ -1601,6 +1816,11 @@ export default function App() {
       });
       setActiveReceiptExpense(updated);
       showToast('Đã cập nhật ảnh chứng từ!');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expense_upsert',
+        expense: updated,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         syncExpenseToFirestore(firebaseUid, updated, (updatedWithUrls) => {
@@ -1615,6 +1835,69 @@ export default function App() {
     } catch (err: any) {
       console.error('Error updating images:', err);
       showToast(err?.message || 'Không thể lưu ảnh chứng từ.');
+    }
+  };
+
+  // Action: Drop image file(s) directly onto an expense row or card on the main screen ("ở ngoài")
+  const handleDropFilesOnExpense = async (
+    expense: ExpenseItem,
+    files: Array<File | Blob>
+  ) => {
+    if (!files || files.length === 0) return;
+    setIsGlobalDraggingFiles(false);
+    globalDragDepthRef.current = 0;
+    setUploadingExpenseId(expense.id);
+
+    try {
+      const newPhotos: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const compressed = await compressImage(files[i], 1280, 0.7);
+          newPhotos.push(compressed);
+        } catch (err) {
+          console.error('Error compressing dropped image:', err);
+        }
+      }
+
+      if (newPhotos.length > 0) {
+        const updatedImages = [...(expense.images || []), ...newPhotos];
+        await handleUpdateImages(expense.id, updatedImages);
+        showToast(
+          `Đã thả & đính kèm ${newPhotos.length} ảnh chứng từ vào "${expense.description}"!`
+        );
+      }
+    } finally {
+      setUploadingExpenseId(null);
+    }
+  };
+
+  // Action: Paste screenshot from clipboard directly into a specific expense row/card on the main screen
+  const handlePasteClipboardToExpense = async (expense: ExpenseItem) => {
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.read) {
+        handleOpenReceiptViewer(expense);
+        showToast('Hãy bấm tổ hợp phím Ctrl+V để dán ảnh chụp màn hình vào khoản chi này.');
+        return;
+      }
+
+      const items = await navigator.clipboard.read();
+      const imageBlobs: Blob[] = [];
+      for (const item of items) {
+        const imgType = item.types.find((t) => t.startsWith('image/'));
+        if (imgType) {
+          const blob = await item.getType(imgType);
+          if (blob) imageBlobs.push(blob);
+        }
+      }
+
+      if (imageBlobs.length > 0) {
+        await handleDropFilesOnExpense(expense, imageBlobs);
+      } else {
+        showToast('Không tìm thấy ảnh trong bộ nhớ tạm. Hãy chụp màn hình (PrtScn / Win+Shift+S) trước.');
+      }
+    } catch {
+      handleOpenReceiptViewer(expense);
+      showToast('Đã mở khung chứng từ — Hãy bấm Ctrl+V để dán ảnh chụp màn hình.');
     }
   };
 
@@ -1655,6 +1938,11 @@ export default function App() {
       });
       setActiveReceiptExpense(updated);
       showToast('Đã cập nhật thông tin khoản chi từ hóa đơn AI!');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:expense_upsert',
+        expense: updated,
+        timestamp: Date.now(),
+      });
       if (firebaseUid) {
         setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
         syncExpenseToFirestore(firebaseUid, updated)
@@ -1686,6 +1974,11 @@ export default function App() {
         return nextAdvances;
       });
       showToast('Đã ghi nhận khoản tạm ứng!');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:advance_upsert',
+        advance: adv,
+        timestamp: Date.now(),
+      });
       scheduleAutoBackup(undefined, nextAdvances);
     } catch (err: any) {
       console.error('Error saving advance:', err);
@@ -1702,6 +1995,11 @@ export default function App() {
         return nextAdvances;
       });
       showToast('Đã xóa đợt tạm ứng.');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:advance_delete',
+        advanceId: id,
+        timestamp: Date.now(),
+      });
       scheduleAutoBackup(undefined, nextAdvances);
     } catch (err) {
       console.error('Error deleting advance:', err);
@@ -1725,6 +2023,11 @@ export default function App() {
       });
       setActiveProfileId(newProfile.id);
       showToast(`Đã tạo hồ sơ "${name}"!`);
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:profile_upsert',
+        profile: newProfile,
+        timestamp: Date.now(),
+      });
       scheduleAutoBackup(undefined, undefined, nextProfiles);
     } catch (err: any) {
       console.error('Error creating profile:', err);
@@ -1747,6 +2050,11 @@ export default function App() {
         return nextProfiles;
       });
       showToast(`Đã đổi tên hồ sơ thành "${cleanName}"!`);
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:profile_upsert',
+        profile: updated,
+        timestamp: Date.now(),
+      });
       scheduleAutoBackup(undefined, undefined, nextProfiles);
     } catch (err) {
       console.error('Error renaming profile:', err);
@@ -1765,6 +2073,11 @@ export default function App() {
       });
       setActiveProfileId('all');
       showToast('Đã xóa hồ sơ.');
+      lanManagerRef.current?.broadcastData({
+        action: 'sync:profile_delete',
+        profileId,
+        timestamp: Date.now(),
+      });
       scheduleAutoBackup(undefined, undefined, nextProfiles);
     } catch (err) {
       console.error('Error deleting profile:', err);
@@ -1787,6 +2100,14 @@ export default function App() {
         setSelectedMonth('all');
         setSearchTerm('');
         showToast(`Đã thay thế toàn bộ bằng ${saved.length} khoản chi mới!`);
+        lanManagerRef.current?.broadcastData({
+          action: 'sync:full_state',
+          mode: 'replace',
+          expenses: saved,
+          advances: latestDataRef.current.advances,
+          profiles: latestDataRef.current.profiles,
+          timestamp: Date.now(),
+        });
         if (firebaseUid) {
           setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
           deleteExpensesBulkFromFirestore(firebaseUid, oldIds)
@@ -1806,6 +2127,11 @@ export default function App() {
         });
         setSelectedMonth('all');
         showToast(`Đã gộp thêm ${itemsWithProfile.length} khoản chi từ Excel!`);
+        lanManagerRef.current?.broadcastData({
+          action: 'sync:expenses_bulk_upsert',
+          expenses: itemsWithProfile,
+          timestamp: Date.now(),
+        });
         if (firebaseUid) {
           setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
           syncExpensesBulkToFirestore(firebaseUid, itemsWithProfile)
@@ -1877,6 +2203,15 @@ export default function App() {
       `Đã khôi phục thành công ${finalList.length} khoản chi và ${totalImages} ảnh chứng từ!`
     );
 
+    lanManagerRef.current?.broadcastData({
+      action: 'sync:full_state',
+      mode,
+      expenses: finalList,
+      advances: restoredAdvances || latestDataRef.current.advances,
+      profiles: restoredProfiles || latestDataRef.current.profiles,
+      timestamp: Date.now(),
+    });
+
     if (firebaseUid) {
       setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
       syncExpensesBulkToFirestore(firebaseUid, finalList)
@@ -1903,6 +2238,10 @@ export default function App() {
     setSearchTerm('');
     setOnlyMissingReceipts(false);
     setActiveReceiptExpense(null);
+    lanManagerRef.current?.broadcastData({
+      action: 'sync:clear_all',
+      timestamp: Date.now(),
+    });
     if (firebaseUid && oldIds.length > 0) {
       setRealtimeSyncStatus(navigator.onLine ? 'syncing' : 'offline');
       deleteExpensesBulkFromFirestore(firebaseUid, oldIds)
@@ -1912,6 +2251,244 @@ export default function App() {
         .catch(() => {});
     }
     showToast('Đã xóa toàn bộ dữ liệu chi tiêu hiện tại.');
+  };
+
+  // ============================================================================
+  // REAL-TIME LAN / P2P SYNCHRONIZATION ENGINE INITIALIZATION & HANDLERS
+  // ============================================================================
+  const handleReceiveLanPayload = useCallback(
+    async (payload: LanSyncPayload, fromPeer: { peerId: string; deviceName: string }) => {
+      try {
+        switch (payload.action) {
+          case 'sync:full_state': {
+            const incomingExpenses = Array.isArray(payload.expenses) ? payload.expenses : [];
+            const mode = payload.mode || 'merge';
+            let updatedExpenses: ExpenseItem[] = [];
+            if (mode === 'replace') {
+              updatedExpenses = await replaceAllExpenses(incomingExpenses);
+            } else {
+              updatedExpenses = await mergeExpensesWithExisting(
+                incomingExpenses,
+                latestDataRef.current.expenses
+              );
+            }
+            setExpenses(updatedExpenses);
+
+            if (Array.isArray(payload.advances) && payload.advances.length > 0) {
+              const advMap = new Map<string, AdvancePaymentItem>();
+              if (mode === 'merge') {
+                latestDataRef.current.advances.forEach((a) => advMap.set(a.id, a));
+              }
+              payload.advances.forEach((a) => advMap.set(a.id, a));
+              const savedAdv = await replaceAllAdvances(Array.from(advMap.values()));
+              setAdvances(savedAdv);
+            }
+
+            if (Array.isArray(payload.profiles) && payload.profiles.length > 0) {
+              const profMap = new Map<string, ExpenseProfile>();
+              if (mode === 'merge') {
+                latestDataRef.current.profiles.forEach((p) => profMap.set(p.id, p));
+              }
+              payload.profiles.forEach((p) => profMap.set(p.id, p));
+              const savedProf = await replaceAllProfiles(Array.from(profMap.values()));
+              setProfiles(savedProf);
+            }
+
+            showToast(
+              `Đã đồng bộ LAN từ ${fromPeer.deviceName}: ${updatedExpenses.length} khoản chi!`
+            );
+            break;
+          }
+
+          case 'sync:expense_upsert': {
+            const exp = payload.expense;
+            if (!exp || !exp.id) break;
+            await saveExpense(exp);
+            setExpenses((prev) => {
+              const exists = prev.some((it) => it.id === exp.id);
+              return exists ? prev.map((it) => (it.id === exp.id ? exp : it)) : [exp, ...prev];
+            });
+            setActiveReceiptExpense((prev) => (prev && prev.id === exp.id ? exp : prev));
+            showToast(`LAN (${fromPeer.deviceName}): Đã cập nhật "${exp.description}"`);
+            break;
+          }
+
+          case 'sync:expenses_bulk_upsert': {
+            const list = Array.isArray(payload.expenses) ? payload.expenses : [];
+            if (list.length === 0) break;
+            const merged = await mergeExpensesWithExisting(list, latestDataRef.current.expenses);
+            setExpenses(merged);
+            showToast(`LAN (${fromPeer.deviceName}): Đã đồng bộ ${list.length} khoản chi!`);
+            break;
+          }
+
+          case 'sync:expense_delete': {
+            const id = payload.expenseId;
+            if (!id) break;
+            await deleteExpense(id);
+            setExpenses((prev) => prev.filter((it) => it.id !== id));
+            break;
+          }
+
+          case 'sync:expenses_bulk_delete': {
+            const ids = Array.isArray(payload.expenseIds) ? payload.expenseIds : [];
+            if (ids.length === 0) break;
+            const idSet = new Set(ids);
+            for (const id of ids) {
+              await deleteExpense(id);
+            }
+            setExpenses((prev) => prev.filter((it) => !idSet.has(it.id)));
+            break;
+          }
+
+          case 'sync:clear_all': {
+            await clearAllExpenses();
+            await replaceAllAdvances([]);
+            setExpenses([]);
+            setAdvances([]);
+            showToast(`LAN (${fromPeer.deviceName}): Đã xóa trắng dữ liệu.`);
+            break;
+          }
+
+          case 'sync:advance_upsert': {
+            const adv = payload.advance;
+            if (!adv || !adv.id) break;
+            await saveAdvance(adv);
+            setAdvances((prev) => {
+              const exists = prev.some((a) => a.id === adv.id);
+              return exists ? prev.map((a) => (a.id === adv.id ? adv : a)) : [adv, ...prev];
+            });
+            break;
+          }
+
+          case 'sync:advance_delete': {
+            const advId = payload.advanceId;
+            if (!advId) break;
+            await deleteAdvance(advId);
+            setAdvances((prev) => prev.filter((a) => a.id !== advId));
+            break;
+          }
+
+          case 'sync:profile_upsert': {
+            const prof = payload.profile;
+            if (!prof || !prof.id) break;
+            await saveProfile(prof);
+            setProfiles((prev) => {
+              const exists = prev.some((p) => p.id === prof.id);
+              return exists ? prev.map((p) => (p.id === prof.id ? prof : p)) : [...prev, prof];
+            });
+            break;
+          }
+
+          case 'sync:profile_delete': {
+            const profId = payload.profileId;
+            if (!profId) break;
+            await deleteProfile(profId);
+            setProfiles((prev) => prev.filter((p) => p.id !== profId));
+            break;
+          }
+        }
+      } catch (err) {
+        console.error('[LAN Sync] Error applying incoming payload:', err);
+      }
+    },
+    []
+  );
+
+  const handleReceiveLanPayloadRef = useRef(handleReceiveLanPayload);
+  useEffect(() => {
+    handleReceiveLanPayloadRef.current = handleReceiveLanPayload;
+  }, [handleReceiveLanPayload]);
+
+  useEffect(() => {
+    const manager = new LanSyncManager({
+      onStatusChange: (st, code) => {
+        setLanStatus(st);
+        setLanRoomCode(code);
+      },
+      onPeersChange: (peerList) => {
+        setLanPeers(peerList);
+      },
+      onReceivePayload: (payload, fromPeer) => {
+        handleReceiveLanPayloadRef.current(payload, fromPeer);
+      },
+      onLogActivity: (item) => {
+        setLanActivityLogs((prev) => [item, ...prev].slice(0, 30));
+      },
+      getCurrentFullState: () => latestDataRef.current,
+    });
+    lanManagerRef.current = manager;
+
+    // Check URL param ?lan=XXXXXX first (e.g. from QR scan)
+    let initialCode = '';
+    let fromUrlParam = false;
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const lanParam = params.get('lan');
+      if (lanParam && lanParam.trim()) {
+        initialCode = lanParam.trim();
+        fromUrlParam = true;
+        // Clean URL param without reload
+        const cleanUrl = window.location.pathname + window.location.hash;
+        window.history.replaceState({}, '', cleanUrl);
+      }
+    }
+
+    if (!initialCode && getAutoJoinLanRoom()) {
+      initialCode = getSavedRoomCode();
+    }
+
+    if (initialCode) {
+      manager.connect(initialCode).then(() => {
+        if (fromUrlParam) {
+          setIsLanSyncModalOpen(true);
+          setTimeout(() => {
+            manager.broadcastData({
+              action: 'sync:request_full',
+              mode: 'merge',
+              timestamp: Date.now(),
+            });
+          }, 1000);
+        }
+      });
+    }
+
+    return () => {
+      manager.disconnect(false);
+    };
+  }, []);
+
+  const handleConnectLanRoom = (code: string) => {
+    lanManagerRef.current?.connect(code);
+    showToast(`Đã mở phòng đồng bộ LAN #${code}!`);
+  };
+
+  const handleDisconnectLanRoom = () => {
+    lanManagerRef.current?.disconnect(false);
+    showToast('Đã ngắt kết nối phòng đồng bộ LAN.');
+  };
+
+  const handlePushFullStateToLanPeers = (mode: 'merge' | 'replace') => {
+    lanManagerRef.current?.broadcastData({
+      action: 'sync:full_state',
+      mode,
+      expenses: latestDataRef.current.expenses,
+      advances: latestDataRef.current.advances,
+      profiles: latestDataRef.current.profiles,
+      timestamp: Date.now(),
+    });
+    showToast(
+      `Đã phát toàn bộ ${latestDataRef.current.expenses.length} khoản chi sang các máy trong phòng LAN!`
+    );
+  };
+
+  const handleRequestFullStateFromLanPeers = () => {
+    lanManagerRef.current?.broadcastData({
+      action: 'sync:request_full',
+      mode: 'merge',
+      timestamp: Date.now(),
+    });
+    showToast('Đang yêu cầu dữ liệu từ các máy trong phòng LAN...');
   };
 
   return (
@@ -1976,6 +2553,25 @@ export default function App() {
         </div>
       )}
 
+      {/* Global Dragging Files Indicator Banner ("Drop ở ngoài") */}
+      {isGlobalDraggingFiles && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-50 pointer-events-none max-w-xl w-[94%]">
+          <div className="bg-teal-900/95 backdrop-blur-md text-white px-4 py-3 rounded-2xl shadow-2xl border-2 border-dashed border-teal-300 flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-teal-700 flex items-center justify-center shrink-0">
+              <Upload size={18} className="text-teal-200 animate-bounce" />
+            </div>
+            <div className="text-xs">
+              <p className="font-bold text-teal-100">
+                Thả ảnh trực tiếp vào dòng / thẻ chi tiêu bất kỳ bên dưới để đính kèm chứng từ
+              </p>
+              <p className="text-[11px] text-teal-200/90 mt-0.5">
+                Hoặc thả ảnh vào vùng trống bất kỳ trên màn hình để chọn khoản chi / tạo khoản chi mới bằng AI
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Header with Navigation & Filter Bar */}
       <Header
         currentTab={currentTab}
@@ -1988,6 +2584,10 @@ export default function App() {
         onOpenExportModal={() => setIsExportModalOpen(true)}
         onOpenBulkModal={() => setIsBulkModalOpen(true)}
         onOpenSettings={() => setIsSettingsModalOpen(true)}
+        onOpenLanSyncModal={() => setIsLanSyncModalOpen(true)}
+        lanConnected={lanStatus === 'connected' && Boolean(lanRoomCode)}
+        lanRoomCode={lanRoomCode}
+        lanPeersCount={lanPeers.length}
         searchTerm={searchTerm}
         setSearchTerm={setSearchTerm}
         selectedMonth={selectedMonth}
@@ -2042,6 +2642,10 @@ export default function App() {
           onQuickSyncDriveNow={() =>
             performDriveUpload(expenses, advances, profiles, false)
           }
+          onOpenLanSyncModal={() => setIsLanSyncModalOpen(true)}
+          lanConnected={lanStatus === 'connected' && Boolean(lanRoomCode)}
+          lanRoomCode={lanRoomCode}
+          lanPeersCount={lanPeers.length}
         />
 
         {/* Requirement 4: Advance Payments & Settlement Summary Panel */}
@@ -2104,6 +2708,13 @@ export default function App() {
                 onDeleteExpense={handleDeleteExpense}
                 onOpenReceiptViewer={handleOpenReceiptViewer}
                 onAddNewToMonth={(month) => handleOpenAddModal(month)}
+                onDropFilesOnExpense={handleDropFilesOnExpense}
+                onPasteClipboardToExpense={handlePasteClipboardToExpense}
+                onHoverExpense={(id) => {
+                  hoveredExpenseIdRef.current = id;
+                }}
+                uploadingExpenseId={uploadingExpenseId}
+                isGlobalDraggingFiles={isGlobalDraggingFiles}
                 grandTotal={totalAmount}
                 totalExpensesCount={filteredExpenses.length}
                 duplicateIdsSet={duplicateIdsSet}
@@ -2136,6 +2747,13 @@ export default function App() {
                 onDeleteExpense={handleDeleteExpense}
                 onOpenReceiptViewer={handleOpenReceiptViewer}
                 onAddNewToMonth={(month) => handleOpenAddModal(month)}
+                onDropFilesOnExpense={handleDropFilesOnExpense}
+                onPasteClipboardToExpense={handlePasteClipboardToExpense}
+                onHoverExpense={(id) => {
+                  hoveredExpenseIdRef.current = id;
+                }}
+                uploadingExpenseId={uploadingExpenseId}
+                isGlobalDraggingFiles={isGlobalDraggingFiles}
                 duplicateIdsSet={duplicateIdsSet}
                 missingReceiptsCount={missingReceiptsCount}
                 onlyMissingReceipts={onlyMissingReceipts}
@@ -2237,13 +2855,244 @@ export default function App() {
       {/* Modals */}
       <ExpenseModal
         isOpen={isExpenseModalOpen}
-        onClose={() => setIsExpenseModalOpen(false)}
+        onClose={() => {
+          setIsExpenseModalOpen(false);
+          setInitialModalImages(null);
+        }}
         onSave={handleSaveExpense}
         editingItem={editingExpense}
         defaultMonth={defaultMonthForNew}
         existingExpenses={expenses}
         activeProfileId={activeProfileId !== 'all' ? activeProfileId : 'default'}
+        initialImages={initialModalImages}
+        onClearInitialImages={() => setInitialModalImages(null)}
       />
+
+      {/* Quick Outside-Dropped Receipt Assignment Modal */}
+      {droppedOutsidePayload && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
+          onClick={() => setDroppedOutsidePayload(null)}
+        >
+          <div
+            className="bg-white rounded-2xl max-w-2xl w-full shadow-2xl border border-slate-200 overflow-hidden my-auto max-h-[90vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="px-5 py-4 bg-gradient-to-r from-teal-800 to-slate-900 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-white/15 flex items-center justify-center">
+                  <ImagePlus size={19} className="text-teal-300" />
+                </div>
+                <div>
+                  <h3 className="text-sm sm:text-base font-bold">
+                    Đã nhận {droppedOutsidePayload.images.length} ảnh vừa thả ở ngoài màn hình
+                  </h3>
+                  <p className="text-[11px] text-teal-200">
+                    Chọn khoản chi bên dưới để đính kèm ngay hoặc tạo khoản chi mới từ ảnh này
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDroppedOutsidePayload(null)}
+                className="p-1.5 text-slate-300 hover:text-white rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-4 sm:p-5 space-y-4 overflow-y-auto flex-1">
+              {/* Preview of dropped images & Primary Actions */}
+              <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                <div className="flex items-center gap-2.5 overflow-x-auto">
+                  {droppedOutsidePayload.images.map((img, idx) => (
+                    <img
+                      key={idx}
+                      src={img}
+                      alt={`Ảnh vừa thả ${idx + 1}`}
+                      className="h-16 w-16 object-cover rounded-lg border border-slate-300 shadow-2xs shrink-0"
+                    />
+                  ))}
+                  <div className="text-xs text-slate-600">
+                    <p className="font-semibold text-slate-800">
+                      {droppedOutsidePayload.images.length} ảnh đã sẵn sàng
+                    </p>
+                    <p className="text-[11px] text-slate-500">
+                      Mẹo: Bạn cũng có thể thả thẳng ảnh vào từng dòng/thẻ trên bảng
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const imgs = droppedOutsidePayload.images;
+                      setDroppedOutsidePayload(null);
+                      setEditingExpense(null);
+                      setInitialModalImages(imgs);
+                      if (availableMonths.length > 0) {
+                        setDefaultMonthForNew(availableMonths[availableMonths.length - 1]);
+                      }
+                      setIsExpenseModalOpen(true);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-teal-700 hover:bg-teal-800 text-white text-xs font-semibold flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  >
+                    <Sparkles size={14} />
+                    <span>Tạo khoản chi mới từ ảnh này (AI đọc HĐ)</span>
+                  </button>
+
+                  {droppedOutsidePayload.rawFiles.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const firstFile = droppedOutsidePayload.rawFiles[0];
+                        setDroppedOutsidePayload(null);
+                        handleOpenPasteExcelModal({
+                          id: `drop_excel_${Date.now()}`,
+                          imageBlob: firstFile,
+                        });
+                      }}
+                      className="px-3 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-900 border border-emerald-200 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                    >
+                      <ClipboardPaste size={14} />
+                      <span>Quét bảng Excel từ ảnh</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Filter & Search Existing Expenses to Attach */}
+              <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-slate-700 uppercase tracking-wide">
+                    Hoặc bấm chọn 1 khoản chi có sẵn để gắn ảnh ngay:
+                  </span>
+                  <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setDroppedOutsideFilter('missing')}
+                      className={`px-2.5 py-1 rounded-lg font-semibold transition-colors cursor-pointer ${
+                        droppedOutsideFilter === 'missing'
+                          ? 'bg-white text-amber-900 shadow-2xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Đang thiếu ảnh (
+                      {
+                        profileExpenses.filter(
+                          (e) => !Array.isArray(e.images) || e.images.length === 0
+                        ).length
+                      }
+                      )
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDroppedOutsideFilter('all')}
+                      className={`px-2.5 py-1 rounded-lg font-semibold transition-colors cursor-pointer ${
+                        droppedOutsideFilter === 'all'
+                          ? 'bg-white text-teal-900 shadow-2xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      Tất cả ({profileExpenses.length})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="relative">
+                  <Search
+                    size={15}
+                    className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+                  />
+                  <input
+                    type="text"
+                    value={droppedOutsideSearch}
+                    onChange={(e) => setDroppedOutsideSearch(e.target.value)}
+                    placeholder="Tìm nhanh theo ngày, nội dung hoặc số tiền..."
+                    className="w-full pl-9 pr-3 py-2 text-xs rounded-xl border border-slate-300 focus:outline-hidden focus:ring-2 focus:ring-teal-500/30 focus:border-teal-600"
+                  />
+                </div>
+
+                <div className="max-h-64 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-xl bg-white">
+                  {profileExpenses
+                    .filter((item) => {
+                      if (
+                        droppedOutsideFilter === 'missing' &&
+                        Array.isArray(item.images) &&
+                        item.images.length > 0
+                      ) {
+                        return false;
+                      }
+                      if (droppedOutsideSearch.trim()) {
+                        const q = removeVietnameseAccents(droppedOutsideSearch.trim());
+                        const desc = removeVietnameseAccents(item.description);
+                        const dt = removeVietnameseAccents(item.date || '');
+                        const amt = String(item.amount || '');
+                        return desc.includes(q) || dt.includes(q) || amt.includes(q);
+                      }
+                      return true;
+                    })
+                    .slice(0, 40)
+                    .map((item) => {
+                      const imgCount = Array.isArray(item.images) ? item.images.length : 0;
+                      return (
+                        <div
+                          key={item.id}
+                          className="p-2.5 sm:px-3.5 flex items-center justify-between gap-2 hover:bg-teal-50/50 transition-colors"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 text-xs">
+                              <span className="font-mono text-slate-500 shrink-0">
+                                {item.date}
+                              </span>
+                              <span className="font-semibold text-slate-800 truncate">
+                                {item.description}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5 text-[11px]">
+                              <span className="font-bold font-mono text-teal-800">
+                                {formatVND(item.amount)}
+                              </span>
+                              <span className="text-slate-400">•</span>
+                              <span
+                                className={
+                                  imgCount > 0 ? 'text-teal-600' : 'text-amber-700 font-medium'
+                                }
+                              >
+                                {imgCount > 0 ? `Đã có ${imgCount} ảnh` : 'Chưa có ảnh'}
+                              </span>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const imgsToAppend = droppedOutsidePayload.images;
+                              setDroppedOutsidePayload(null);
+                              await handleUpdateImages(item.id, [
+                                ...(item.images || []),
+                                ...imgsToAppend,
+                              ]);
+                              showToast(
+                                `Đã gắn ${imgsToAppend.length} ảnh vào "${item.description}"!`
+                              );
+                            }}
+                            className="px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white text-xs font-semibold shrink-0 transition-colors cursor-pointer"
+                          >
+                            Gắn vào khoản này
+                          </button>
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <ReceiptViewerModal
         expense={activeReceiptExpense}
@@ -2357,6 +3206,29 @@ export default function App() {
         isSyncing={driveSyncStatus === 'syncing'}
         onConfirmDownloadFromDrive={handleConfirmDownloadFromDrive}
         onConfirmUploadToDrive={handleConfirmUploadToDriveFromModal}
+      />
+
+      <LanSyncModal
+        isOpen={isLanSyncModalOpen}
+        onClose={() => setIsLanSyncModalOpen(false)}
+        status={lanStatus}
+        roomCode={lanRoomCode}
+        deviceName={lanDeviceName}
+        onUpdateDeviceName={(name) => {
+          setLanDeviceName(name);
+          lanManagerRef.current?.setDeviceName(name);
+        }}
+        peers={lanPeers}
+        activityLogs={lanActivityLogs}
+        localExpensesCount={expenses.length}
+        localImagesCount={expenses.reduce(
+          (sum, item) => sum + (Array.isArray(item.images) ? item.images.length : 0),
+          0
+        )}
+        onConnectRoom={handleConnectLanRoom}
+        onDisconnectRoom={handleDisconnectLanRoom}
+        onPushFullStateToPeers={handlePushFullStateToLanPeers}
+        onRequestFullStateFromPeers={handleRequestFullStateFromLanPeers}
       />
     </div>
   );

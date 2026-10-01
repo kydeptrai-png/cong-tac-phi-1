@@ -1,7 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Camera,
   Image as ImageIcon,
+  ImagePlus,
+  Upload,
+  ClipboardPaste,
   Edit2,
   Trash2,
   Plus,
@@ -27,6 +30,11 @@ interface CardViewProps {
   onDeleteExpense: (id: string) => void;
   onOpenReceiptViewer: (expense: ExpenseItem) => void;
   onAddNewToMonth: (monthTitle: string) => void;
+  onDropFilesOnExpense?: (expense: ExpenseItem, files: File[]) => Promise<void> | void;
+  onPasteClipboardToExpense?: (expense: ExpenseItem) => Promise<void> | void;
+  onHoverExpense?: (expenseId: string | null) => void;
+  uploadingExpenseId?: string | null;
+  isGlobalDraggingFiles?: boolean;
   duplicateIdsSet: Set<string>;
   missingReceiptsCount: number;
   onlyMissingReceipts: boolean;
@@ -49,6 +57,11 @@ export const CardView: React.FC<CardViewProps> = ({
   onDeleteExpense,
   onOpenReceiptViewer,
   onAddNewToMonth,
+  onDropFilesOnExpense,
+  onPasteClipboardToExpense,
+  onHoverExpense,
+  uploadingExpenseId = null,
+  isGlobalDraggingFiles = false,
   duplicateIdsSet,
   missingReceiptsCount,
   onlyMissingReceipts,
@@ -64,6 +77,31 @@ export const CardView: React.FC<CardViewProps> = ({
   onCollapseAllMonths,
   onExpandAllMonths,
 }) => {
+  const [dragOverExpenseId, setDragOverExpenseId] = useState<string | null>(null);
+
+  const extractImageFilesFromDataTransfer = (dt: DataTransfer | null): File[] => {
+    if (!dt) return [];
+    const files: File[] = [];
+    if (dt.files && dt.files.length > 0) {
+      for (let i = 0; i < dt.files.length; i++) {
+        const f = dt.files[i];
+        if (f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|heic)$/i.test(f.name)) {
+          files.push(f);
+        }
+      }
+    }
+    if (files.length === 0 && dt.items && dt.items.length > 0) {
+      for (let i = 0; i < dt.items.length; i++) {
+        const item = dt.items[i];
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    return files;
+  };
+
   const settledInViewCount = monthGroups.filter((g) =>
     settledMonthKeys.has(g.monthKey)
   ).length;
@@ -338,12 +376,52 @@ export const CardView: React.FC<CardViewProps> = ({
                         const isRefund = item.amount < 0;
                         const isSuspectedDuplicate = duplicateIdsSet.has(item.id);
                         const isSelected = selectedIds.has(item.id);
+                        const isDragOverCard = dragOverExpenseId === item.id;
+                        const isUploadingThisCard = uploadingExpenseId === item.id;
 
                         return (
                           <div
                             key={item.id}
-                            className={`rounded-2xl border p-4 shadow-2xs flex flex-col justify-between transition-all group ${
-                              isSelected
+                            onMouseEnter={() => onHoverExpense?.(item.id)}
+                            onMouseLeave={() => onHoverExpense?.(null)}
+                            onDragEnter={(e) => {
+                              if (!onDropFilesOnExpense) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setDragOverExpenseId(item.id);
+                            }}
+                            onDragOver={(e) => {
+                              if (!onDropFilesOnExpense) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              e.dataTransfer.dropEffect = 'copy';
+                              if (dragOverExpenseId !== item.id) {
+                                setDragOverExpenseId(item.id);
+                              }
+                            }}
+                            onDragLeave={(e) => {
+                              if (!onDropFilesOnExpense) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              const related = e.relatedTarget as Node | null;
+                              if (!related || !e.currentTarget.contains(related)) {
+                                setDragOverExpenseId((prev) => (prev === item.id ? null : prev));
+                              }
+                            }}
+                            onDrop={(e) => {
+                              if (!onDropFilesOnExpense) return;
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setDragOverExpenseId(null);
+                              const files = extractImageFilesFromDataTransfer(e.dataTransfer);
+                              if (files.length > 0) {
+                                onDropFilesOnExpense(item, files);
+                              }
+                            }}
+                            className={`rounded-2xl border p-4 shadow-2xs flex flex-col justify-between transition-all group relative ${
+                              isDragOverCard
+                                ? 'bg-teal-50/95 border-2 border-dashed border-teal-600 ring-4 ring-teal-500/20 shadow-md'
+                                : isSelected
                                 ? 'bg-teal-50/90 border-teal-500 ring-2 ring-teal-500/20 shadow-xs'
                                 : isSuspectedDuplicate
                                 ? 'bg-amber-50/40 border-amber-300 hover:border-amber-400'
@@ -421,26 +499,63 @@ export const CardView: React.FC<CardViewProps> = ({
                                 {formatVND(item.amount)}
                               </div>
 
-                              {/* Receipt thumbnails if any */}
-                              {hasImages && (
+                              {/* Receipt thumbnails or direct drop area */}
+                              {isUploadingThisCard ? (
+                                <div className="flex items-center justify-center gap-2 mb-3 p-2.5 bg-teal-50 rounded-xl border border-teal-200 text-xs font-semibold text-teal-800">
+                                  <div className="w-4 h-4 border-2 border-teal-700 border-t-transparent rounded-full animate-spin shrink-0" />
+                                  <span>Đang nén & lưu ảnh chứng từ...</span>
+                                </div>
+                              ) : isDragOverCard ? (
+                                <div className="flex items-center justify-center gap-2 mb-3 p-3 bg-teal-700 text-white rounded-xl border-2 border-dashed border-white text-xs font-bold shadow-sm animate-pulse">
+                                  <Upload size={15} className="shrink-0" />
+                                  <span>Thả ảnh vào đây để gắn chứng từ</span>
+                                </div>
+                              ) : hasImages ? (
                                 <div
                                   onClick={() => onOpenReceiptViewer(item)}
-                                  className="flex items-center gap-2 mb-3 p-1.5 bg-slate-50 rounded-xl border border-slate-100 cursor-pointer hover:bg-teal-50/50 transition-colors"
-                                  title="Bấm để xem ảnh phóng to"
+                                  className={`flex items-center justify-between gap-2 mb-3 p-1.5 rounded-xl border cursor-pointer transition-colors ${
+                                    isGlobalDraggingFiles
+                                      ? 'bg-teal-50/90 border-2 border-dashed border-teal-500'
+                                      : 'bg-slate-50 border-slate-100 hover:bg-teal-50/50'
+                                  }`}
+                                  title="Bấm để xem ảnh phóng to hoặc Kéo thả thêm ảnh vào thẻ này"
                                 >
-                                  <div className="flex -space-x-2 overflow-hidden">
-                                    {item.images.slice(0, 3).map((img, i) => (
-                                      <img
-                                        key={i}
-                                        src={img}
-                                        alt="Chứng từ"
-                                        className="inline-block h-9 w-9 rounded-lg object-cover ring-2 ring-white"
-                                      />
-                                    ))}
+                                  <div className="flex items-center gap-2">
+                                    <div className="flex -space-x-2 overflow-hidden">
+                                      {item.images.slice(0, 3).map((img, i) => (
+                                        <img
+                                          key={i}
+                                          src={img}
+                                          alt="Chứng từ"
+                                          className="inline-block h-9 w-9 rounded-lg object-cover ring-2 ring-white"
+                                        />
+                                      ))}
+                                    </div>
+                                    <span className="text-xs text-teal-700 font-semibold flex items-center gap-1 ml-1">
+                                      <ImageIcon size={13} />
+                                      {item.images.length} ảnh chứng từ
+                                    </span>
                                   </div>
-                                  <span className="text-xs text-teal-700 font-semibold flex items-center gap-1 ml-1">
-                                    <ImageIcon size={13} />
-                                    {item.images.length} ảnh chứng từ
+                                  <span className="text-[10px] font-medium text-slate-400 hidden sm:inline pr-1">
+                                    + Kéo thả thêm
+                                  </span>
+                                </div>
+                              ) : (
+                                <div
+                                  onClick={() => onOpenReceiptViewer(item)}
+                                  className={`flex items-center justify-between gap-2 mb-3 px-3 py-2 rounded-xl border border-dashed cursor-pointer transition-colors ${
+                                    isGlobalDraggingFiles
+                                      ? 'bg-teal-50 border-teal-500 text-teal-900'
+                                      : 'bg-amber-50/40 hover:bg-amber-50/90 border-amber-300/90 text-amber-800'
+                                  }`}
+                                  title="Kéo thả ảnh chứng từ trực tiếp vào thẻ này hoặc bấm để mở"
+                                >
+                                  <span className="text-[11px] font-semibold flex items-center gap-1.5">
+                                    <ImagePlus size={14} className="shrink-0" />
+                                    <span>Kéo thả ảnh chứng từ vào đây</span>
+                                  </span>
+                                  <span className="text-[10px] opacity-75 hidden sm:inline">
+                                    hoặc Ctrl+V
                                   </span>
                                 </div>
                               )}
@@ -448,26 +563,41 @@ export const CardView: React.FC<CardViewProps> = ({
 
                             {/* Bottom Actions */}
                             <div className="flex items-center justify-between pt-2.5 border-t border-slate-100 mt-1">
-                              <button
-                                onClick={() => onOpenReceiptViewer(item)}
-                                className={`min-h-[44px] inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-xl transition-colors cursor-pointer ${
-                                  hasImages
-                                    ? 'text-teal-700 bg-teal-50 hover:bg-teal-100 active:bg-teal-200'
-                                    : 'text-amber-800 bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-200/80'
-                                }`}
-                              >
-                                {hasImages ? (
-                                  <>
-                                    <ImageIcon size={15} />
-                                    <span>Xem ảnh</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <Camera size={15} className="text-amber-700" />
-                                    <span>Chụp / Thêm ảnh</span>
-                                  </>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => onOpenReceiptViewer(item)}
+                                  className={`min-h-[44px] inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-xl transition-colors cursor-pointer ${
+                                    hasImages
+                                      ? 'text-teal-700 bg-teal-50 hover:bg-teal-100 active:bg-teal-200'
+                                      : 'text-amber-800 bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-200/80'
+                                  }`}
+                                >
+                                  {hasImages ? (
+                                    <>
+                                      <ImageIcon size={15} />
+                                      <span>Xem ảnh</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Camera size={15} className="text-amber-700" />
+                                      <span>Chụp / Thêm</span>
+                                    </>
+                                  )}
+                                </button>
+
+                                {onPasteClipboardToExpense && (
+                                  <button
+                                    type="button"
+                                    onClick={() => onPasteClipboardToExpense(item)}
+                                    title="Dán nhanh ảnh chụp màn hình từ bộ nhớ tạm vào thẻ này (hoặc chỉ chuột vào thẻ rồi bấm Ctrl+V)"
+                                    className="min-h-[44px] inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-2 rounded-xl bg-indigo-50/80 hover:bg-indigo-100 text-indigo-800 border border-indigo-200/80 transition-colors cursor-pointer"
+                                  >
+                                    <ClipboardPaste size={14} />
+                                    <span>Dán ảnh</span>
+                                  </button>
                                 )}
-                              </button>
+                              </div>
 
                               <div className="flex items-center gap-1">
                                 <button

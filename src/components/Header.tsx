@@ -16,6 +16,7 @@ import {
   Calendar,
   DollarSign,
   Settings,
+  Wifi,
 } from 'lucide-react';
 import { formatVND } from '../utils/categories';
 
@@ -30,6 +31,10 @@ interface HeaderProps {
   onOpenExportModal: () => void;
   onOpenBulkModal: () => void;
   onOpenSettings: () => void;
+  onOpenLanSyncModal?: () => void;
+  lanConnected?: boolean;
+  lanRoomCode?: string;
+  lanPeersCount?: number;
   searchTerm: string;
   setSearchTerm: (term: string) => void;
   selectedMonth: string;
@@ -63,6 +68,10 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenExportModal,
   onOpenBulkModal,
   onOpenSettings,
+  onOpenLanSyncModal,
+  lanConnected = false,
+  lanRoomCode = '',
+  lanPeersCount = 0,
   searchTerm,
   setSearchTerm,
   selectedMonth,
@@ -108,6 +117,34 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Action Buttons: Compact & Balanced on Mobile, Labeled on Desktop */}
           <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+            {onOpenLanSyncModal && (
+              <button
+                type="button"
+                onClick={onOpenLanSyncModal}
+                title={
+                  lanConnected
+                    ? `Đang đồng bộ LAN thời gian thực (Phòng #${lanRoomCode} • ${lanPeersCount} thiết bị kết nối)`
+                    : 'Đồng bộ trực tiếp giữa các thiết bị qua mạng LAN / Mã 6 số thời gian thực'
+                }
+                aria-label="Đồng bộ LAN"
+                className={`h-9 sm:h-10 min-w-[36px] sm:min-w-[40px] flex items-center justify-center gap-1.5 px-2 sm:px-3 text-xs font-semibold rounded-xl border transition-colors shrink-0 cursor-pointer ${
+                  lanConnected
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-700 shadow-xs'
+                    : 'text-teal-800 hover:text-teal-950 bg-teal-50 hover:bg-teal-100 border-teal-200/80'
+                }`}
+              >
+                <div className="relative flex items-center">
+                  <Wifi size={16} />
+                  {lanConnected && (
+                    <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-emerald-300 animate-ping" />
+                  )}
+                </div>
+                <span className="hidden md:inline">
+                  {lanConnected ? `LAN #${lanRoomCode} (${lanPeersCount + 1})` : 'Đồng bộ LAN'}
+                </span>
+              </button>
+            )}
+
             {onOpenPasteExcelModal && (
               <button
                 type="button"

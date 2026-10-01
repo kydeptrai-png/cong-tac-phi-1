@@ -1613,14 +1613,173 @@ function getImageExtension(dataUrl: string): 'jpeg' | 'png' | 'gif' {
 }
 
 /**
+ * Strictly sanitizes, pads, and validates a base64 string (or data URL) for JSZip / ExcelJS.
+ * Returns null if the input is an HTTP/HTTPS/Blob URL or invalid base64 content length.
+ */
+export function sanitizeAndValidateBase64(input: string): string | null {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  // Reject raw URLs that have not been converted to data: URLs yet
+  if (/^(https?:|blob:)/i.test(trimmed)) {
+    return null;
+  }
+
+  let raw = trimmed;
+  if (raw.startsWith('data:')) {
+    const commaIdx = raw.indexOf(',');
+    if (commaIdx === -1) return null;
+    raw = raw.slice(commaIdx + 1);
+  }
+
+  // Convert URL-safe base64 characters and strip whitespace / non-base64 chars
+  let cleaned = raw
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/[^A-Za-z0-9+/=]/g, '');
+
+  // Strip any existing '=' padding and re-pad cleanly
+  cleaned = cleaned.replace(/=+$/, '');
+
+  // A base64 string with remainder 1 mod 4 is mathematically invalid and causes JSZip "bad content length"
+  if (cleaned.length < 4 || cleaned.length % 4 === 1) {
+    return null;
+  }
+
+  while (cleaned.length % 4 !== 0) {
+    cleaned += '=';
+  }
+
+  // Verify decoding on a small prefix to guarantee JSZip will never throw
+  try {
+    if (typeof atob === 'function') {
+      const sample = atob(cleaned.slice(0, Math.min(cleaned.length, 64)));
+      if (!sample || sample.length === 0) return null;
+    } else if (typeof Buffer !== 'undefined') {
+      const buf = Buffer.from(cleaned.slice(0, Math.min(cleaned.length, 64)), 'base64');
+      if (!buf || buf.length === 0) return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return cleaned;
+}
+
+/**
  * Helper to extract clean base64 data without data-uri prefix
  */
 function extractBase64Data(dataUrl: string): string {
-  const commaIdx = dataUrl.indexOf(',');
-  if (commaIdx !== -1) {
-    return dataUrl.slice(commaIdx + 1);
+  return sanitizeAndValidateBase64(dataUrl) || '';
+}
+
+/**
+ * Resolves any image source (data: URL, blob: URL, or http/https Cloud URL) into a valid data: URL
+ * so ExcelJS can embed cloud-synced receipt images without failing with "Invalid base64 input, bad content length."
+ */
+async function resolveImageSourceToDataUrl(imgSource: string): Promise<string | null> {
+  if (!imgSource || typeof imgSource !== 'string') return null;
+  const trimmed = imgSource.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.startsWith('data:')) {
+    const validB64 = sanitizeAndValidateBase64(trimmed);
+    if (!validB64) return null;
+    const ext = getImageExtension(trimmed);
+    return `data:image/${ext};base64,${validB64}`;
   }
-  return dataUrl;
+
+  if (!/^(https?:|blob:)/i.test(trimmed)) {
+    const validB64 = sanitizeAndValidateBase64(trimmed);
+    return validB64 ? `data:image/jpeg;base64,${validB64}` : null;
+  }
+
+  if (typeof window === 'undefined') return null;
+
+  // 1. Try direct fetch -> Blob -> FileReader DataURL
+  try {
+    const res = await fetch(trimmed);
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob && blob.size > 0) {
+        const dataUrl = await new Promise<string | null>((resolve) => {
+          const reader = new FileReader();
+          reader.onloadend = () =>
+            resolve(typeof reader.result === 'string' ? reader.result : null);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(blob);
+        });
+        if (dataUrl && sanitizeAndValidateBase64(dataUrl)) {
+          return dataUrl;
+        }
+      }
+    }
+  } catch {
+    // Fallback to canvas or server proxy below
+  }
+
+  // 2. Try loading via HTMLImageElement with crossOrigin="anonymous" onto Canvas
+  try {
+    const canvasDataUrl = await new Promise<string | null>((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      const timer = setTimeout(() => resolve(null), 7000);
+      img.onload = () => {
+        clearTimeout(timer);
+        try {
+          const w = img.naturalWidth || img.width;
+          const h = img.naturalHeight || img.height;
+          if (!w || !h) {
+            resolve(null);
+            return;
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = w;
+          canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(null);
+            return;
+          }
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          resolve(canvas.toDataURL('image/jpeg', 0.8));
+        } catch {
+          resolve(null);
+        }
+      };
+      img.onerror = () => {
+        clearTimeout(timer);
+        resolve(null);
+      };
+      img.src = trimmed;
+    });
+    if (canvasDataUrl && sanitizeAndValidateBase64(canvasDataUrl)) {
+      return canvasDataUrl;
+    }
+  } catch {
+    // Fallback to server proxy
+  }
+
+  // 3. Try server proxy endpoint (/api/proxy-image) for CORS-restricted Drive / Storage URLs
+  if (/^https?:/i.test(trimmed)) {
+    try {
+      const proxyRes = await fetch(`/api/proxy-image?url=${encodeURIComponent(trimmed)}`);
+      if (proxyRes.ok) {
+        const json = await proxyRes.json();
+        if (json?.success && typeof json.dataUrl === 'string' && sanitizeAndValidateBase64(json.dataUrl)) {
+          return json.dataUrl;
+        }
+      }
+    } catch {
+      // Ignore offline/proxy error
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -1668,7 +1827,7 @@ export const EXCEL_CELL_PADDING_PX = 6;
 export async function exportExpensesToExcel(items: ExpenseItem[], reportTitle = 'Bao_Cao_Cong_Tac_Phi'): Promise<void> {
   const groups = groupExpensesByMonth(items);
 
-  // Pre-load natural dimensions for all unique images asynchronously
+  // Pre-load resolved Data URLs and natural dimensions for all unique images asynchronously
   const uniqueImages = new Set<string>();
   items.forEach((item) => {
     item.images?.forEach((url) => {
@@ -1676,13 +1835,14 @@ export async function exportExpensesToExcel(items: ExpenseItem[], reportTitle = 
     });
   });
 
-  const dimensionEntries = await Promise.all(
+  const resolvedImageEntries = await Promise.all(
     Array.from(uniqueImages).map(async (url) => {
-      const dims = await getImageDimensions(url);
-      return [url, dims] as const;
+      const resolvedDataUrl = await resolveImageSourceToDataUrl(url);
+      const dims = await getImageDimensions(resolvedDataUrl || url);
+      return [url, { resolvedDataUrl, dims }] as const;
     })
   );
-  const imageDimensionsMap = new Map(dimensionEntries);
+  const resolvedImagesMap = new Map(resolvedImageEntries);
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Sổ Chi Tiêu & Công Tác Phí';
@@ -1900,8 +2060,30 @@ export async function exportExpensesToExcel(items: ExpenseItem[], reportTitle = 
           if (!imgDataUrl) continue;
 
           try {
-            const ext = getImageExtension(imgDataUrl);
-            const b64 = extractBase64Data(imgDataUrl);
+            const resolvedInfo = resolvedImagesMap.get(imgDataUrl);
+            const effectiveDataUrl = resolvedInfo?.resolvedDataUrl || null;
+            const b64 = effectiveDataUrl ? sanitizeAndValidateBase64(effectiveDataUrl) : null;
+
+            if (!effectiveDataUrl || !b64) {
+              // If image is an external cloud link that could not be fetched (e.g. offline),
+              // insert a clickable hyperlink in the cell instead of passing invalid base64 to JSZip
+              if (/^https?:/i.test(imgDataUrl)) {
+                const targetCell = dataRow.getCell(5 + imgIdx);
+                targetCell.value = {
+                  text: `Xem ảnh #${imgIdx + 1}`,
+                  hyperlink: imgDataUrl,
+                };
+                targetCell.font = {
+                  name: 'Arial',
+                  size: 9,
+                  underline: true,
+                  color: { argb: 'FF0284C7' },
+                };
+              }
+              continue;
+            }
+
+            const ext = getImageExtension(effectiveDataUrl);
 
             const imageId = workbook.addImage({
               base64: b64,
@@ -1909,7 +2091,7 @@ export async function exportExpensesToExcel(items: ExpenseItem[], reportTitle = 
             });
 
             // Read original natural dimensions (naturalWidth, naturalHeight)
-            const { naturalWidth, naturalHeight } = imageDimensionsMap.get(imgDataUrl) || {
+            const { naturalWidth, naturalHeight } = resolvedInfo?.dims || {
               naturalWidth: 200,
               naturalHeight: 150,
             };

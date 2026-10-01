@@ -193,6 +193,23 @@ export async function uploadReceiptImageToCloudUrl(
     return imageStr.slice(0, 2048);
   }
 
+  // Normalize data URL base64 padding before uploading
+  const commaIdx = imageStr.indexOf(',');
+  if (commaIdx === -1) return null;
+  const header = imageStr.slice(0, commaIdx + 1);
+  let b64 = imageStr
+    .slice(commaIdx + 1)
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/[^A-Za-z0-9+/=]/g, '')
+    .replace(/=+$/, '');
+  if (b64.length < 4 || b64.length % 4 === 1) return null;
+  while (b64.length % 4 !== 0) {
+    b64 += '=';
+  }
+  const normalizedDataUrl = `${header}${b64}`;
+
   // 1. Try Firebase Storage first
   try {
     const app = getFirebaseAppInstance();
@@ -201,7 +218,7 @@ export async function uploadReceiptImageToCloudUrl(
       const safeExpId = sanitizeFirestoreId(expenseId);
       const path = `users/${uid}/receipts/${safeExpId}_${imageIndex}.jpg`;
       const fileRef = storageRef(storage, path);
-      await uploadString(fileRef, imageStr, 'data_url');
+      await uploadString(fileRef, normalizedDataUrl, 'data_url');
       const downloadUrl = await getDownloadURL(fileRef);
       if (downloadUrl && downloadUrl.length <= 2048) {
         return downloadUrl;
@@ -216,7 +233,7 @@ export async function uploadReceiptImageToCloudUrl(
     const token = getSavedAccessToken();
     if (token) {
       const driveUrl = await uploadReceiptDataUrlToDrive(
-        imageStr,
+        normalizedDataUrl,
         `Receipt_${sanitizeFirestoreId(expenseId)}_${imageIndex}.jpg`,
         token
       );
@@ -254,7 +271,8 @@ export async function resolveCloudImageUrlsForExpense(
       const uploadedUrl = await uploadReceiptImageToCloudUrl(uid, item.id, i, img);
       if (uploadedUrl) {
         cloudUrls.push(uploadedUrl);
-        updatedLocalImages.push(uploadedUrl);
+        // Keep local base64 in IndexedDB for instant offline viewing & Excel/PDF export
+        updatedLocalImages.push(img);
         hasConvertedAny = true;
       } else {
         // Keep base64 locally in IndexedDB, but DO NOT include in Firestore cloudUrls
@@ -341,10 +359,13 @@ export function firestoreDocToExpenseItem(
     ? data.images
     : [];
 
-  // Preserve local base64 images if remote doesn't have uploaded URLs yet
+  // Preserve local base64 images if the local device already has them for offline & Excel export
   const localImages = Array.isArray(localExisting?.images) ? localExisting!.images : [];
+  const hasLocalDataUrls = localImages.some((img) => isDataUrl(img));
   const mergedImages =
-    remoteUrls.length > 0
+    hasLocalDataUrls && localImages.length >= remoteUrls.length
+      ? localImages
+      : remoteUrls.length > 0
       ? remoteUrls
       : localImages;
 

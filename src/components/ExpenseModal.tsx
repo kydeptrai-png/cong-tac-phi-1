@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   X,
   Sparkles,
@@ -11,6 +11,9 @@ import {
   ArrowRight,
   History,
   Wand2,
+  ClipboardPaste,
+  Monitor,
+  ImagePlus,
 } from 'lucide-react';
 import { ExpenseItem, DescriptionSuggestion } from '../types';
 import { formatVND } from '../utils/categories';
@@ -26,6 +29,8 @@ interface ExpenseModalProps {
   defaultMonth?: string;
   existingExpenses?: ExpenseItem[];
   activeProfileId?: string;
+  initialImages?: string[] | null;
+  onClearInitialImages?: () => void;
 }
 
 export const ExpenseModal: React.FC<ExpenseModalProps> = ({
@@ -36,6 +41,8 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
   defaultMonth = 'Tháng 3',
   existingExpenses = [],
   activeProfileId = 'default',
+  initialImages = null,
+  onClearInitialImages,
 }) => {
   const [description, setDescription] = useState('');
   const [amount, setAmount] = useState<number | ''>('');
@@ -44,6 +51,8 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
   const [notes, setNotes] = useState('');
   const [images, setImages] = useState<string[]>([]);
   const [isScanning, setIsScanning] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [isCompressingPhotos, setIsCompressingPhotos] = useState(false);
   const [scanMessage, setScanMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
   );
@@ -104,7 +113,9 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
       const yyyy = today.getFullYear();
       setDate(`${dd}/${mm}/${yyyy}`);
       setNotes('');
-      setImages([]);
+      if (!initialImages || initialImages.length === 0) {
+        setImages([]);
+      }
       setNaturalText('');
     }
     setScanMessage(null);
@@ -144,27 +155,8 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
     return buildDescriptionSuggestions(existingExpenses, description, 6);
   }, [existingExpenses, description]);
 
-  if (!isOpen) return null;
-
-  const handleDescriptionChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setDescription(e.target.value);
-    setShowSuggestions(true);
-    if (pendingDuplicateItem) {
-      setPendingDuplicateItem(null);
-      setMatchedDuplicates([]);
-    }
-  };
-
-  const handleSelectSuggestion = (sug: DescriptionSuggestion, alsoFillAmount: boolean) => {
-    setDescription(sug.description);
-    if (alsoFillAmount && sug.lastAmount !== 0) {
-      setAmount(sug.lastAmount);
-    }
-    setShowSuggestions(false);
-  };
-
   // Requirement 7: Run Gemini AI OCR on a base64 receipt image and auto-fill form fields
-  const runGeminiReceiptReader = async (base64Img: string) => {
+  const runGeminiReceiptReader = useCallback(async (base64Img: string) => {
     setIsScanning(true);
     setScanMessage(null);
     try {
@@ -215,6 +207,101 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
     } finally {
       setIsScanning(false);
     }
+  }, []);
+
+  useEffect(() => {
+    if (isOpen && !editingItem && initialImages && initialImages.length > 0) {
+      setImages(initialImages);
+      runGeminiReceiptReader(initialImages[0]);
+      onClearInitialImages?.();
+    }
+  }, [isOpen, editingItem, initialImages, runGeminiReceiptReader, onClearInitialImages]);
+
+  // Shared helper to process File/Blob list (from file input, drag-and-drop, clipboard paste, or screen capture)
+  const processAndAddImageBlobs = useCallback(
+    async (
+      blobs: Array<File | Blob>,
+      options?: { autoReadWithAI?: boolean; sourceLabel?: string }
+    ) => {
+      if (!blobs || blobs.length === 0) return;
+      setIsCompressingPhotos(true);
+      const newPhotos: string[] = [];
+
+      for (let i = 0; i < blobs.length; i++) {
+        try {
+          const compressed = await compressImage(blobs[i], 1280, 0.7);
+          newPhotos.push(compressed);
+        } catch (err) {
+          console.error('Error compressing image:', err);
+        }
+      }
+      setIsCompressingPhotos(false);
+
+      if (newPhotos.length > 0) {
+        setImages((prev) => [...prev, ...newPhotos]);
+        if (options?.sourceLabel) {
+          setScanMessage({
+            type: 'success',
+            text: `Đã đính kèm ${newPhotos.length} ảnh từ ${options.sourceLabel}.`,
+          });
+        }
+        if (
+          options?.autoReadWithAI ||
+          (!description.trim() && (amount === '' || amount === 0))
+        ) {
+          await runGeminiReceiptReader(newPhotos[0]);
+        }
+      }
+    },
+    [description, amount, runGeminiReceiptReader]
+  );
+
+  // Listen for Ctrl+V / Cmd+V image paste anywhere inside ExpenseModal while open
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const handleModalPaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageBlobs: Blob[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith('image/')) {
+          const blob = item.getAsFile();
+          if (blob) imageBlobs.push(blob);
+        }
+      }
+
+      if (imageBlobs.length > 0) {
+        e.preventDefault();
+        processAndAddImageBlobs(imageBlobs, {
+          sourceLabel: 'ảnh chụp màn hình (Ctrl+V)',
+        });
+      }
+    };
+
+    window.addEventListener('paste', handleModalPaste);
+    return () => window.removeEventListener('paste', handleModalPaste);
+  }, [isOpen, processAndAddImageBlobs]);
+
+  if (!isOpen) return null;
+
+  const handleDescriptionChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setDescription(e.target.value);
+    setShowSuggestions(true);
+    if (pendingDuplicateItem) {
+      setPendingDuplicateItem(null);
+      setMatchedDuplicates([]);
+    }
+  };
+
+  const handleSelectSuggestion = (sug: DescriptionSuggestion, alsoFillAmount: boolean) => {
+    setDescription(sug.description);
+    if (alsoFillAmount && sug.lastAmount !== 0) {
+      setAmount(sug.lastAmount);
+    }
+    setShowSuggestions(false);
   };
 
   // Requirement 1 & 7: Add multiple photos (from library or camera), auto-compress (max 1280px, JPEG 0.7),
@@ -225,26 +312,152 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
   ) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
+    const fileArray = Array.from(files);
+    e.target.value = '';
+    await processAndAddImageBlobs(fileArray, { autoReadWithAI });
+  };
 
-    const newPhotos: string[] = [];
-    for (let i = 0; i < files.length; i++) {
-      try {
-        // Compress max long edge 1280px, JPEG quality 0.7, preserving aspect ratio
-        const compressed = await compressImage(files[i], 1280, 0.7);
-        newPhotos.push(compressed);
-      } catch (err) {
-        console.error('Error compressing image:', err);
-      }
+  // Drag & Drop handlers for receipt images
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isDraggingOver) setIsDraggingOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  };
+
+  const handleDropPhotos = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+
+    const droppedFiles = e.dataTransfer?.files;
+    if (!droppedFiles || droppedFiles.length === 0) return;
+
+    const imageFiles = Array.from(droppedFiles).filter((f) => f.type.startsWith('image/'));
+    if (imageFiles.length === 0) {
+      setScanMessage({
+        type: 'error',
+        text: 'File vừa thả không phải định dạng hình ảnh (PNG, JPG, WebP...).',
+      });
+      return;
     }
 
-    e.target.value = '';
+    await processAndAddImageBlobs(imageFiles, {
+      sourceLabel: 'kéo thả file',
+    });
+  };
 
-    if (newPhotos.length > 0) {
-      setImages((prev) => [...prev, ...newPhotos]);
-      // If user clicked "Quét hóa đơn AI" OR if both description and amount are currently empty, read the first image with Gemini
-      if (autoReadWithAI || (!description.trim() && (amount === '' || amount === 0))) {
-        await runGeminiReceiptReader(newPhotos[0]);
+  // Paste screenshot from Clipboard via button click
+  const handlePasteFromClipboardButton = async () => {
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.read) {
+        setScanMessage({
+          type: 'error',
+          text: 'Trình duyệt không hỗ trợ nút đọc Clipboard trực tiếp. Hãy nhấn tổ hợp phím Ctrl + V (hoặc Cmd + V) để dán ảnh vừa chụp!',
+        });
+        return;
       }
+
+      const clipboardItems = await navigator.clipboard.read();
+      const imageBlobs: Blob[] = [];
+
+      for (const item of clipboardItems) {
+        const imgType = item.types.find((t) => t.startsWith('image/'));
+        if (imgType) {
+          const blob = await item.getType(imgType);
+          if (blob) imageBlobs.push(blob);
+        }
+      }
+
+      if (imageBlobs.length === 0) {
+        setScanMessage({
+          type: 'error',
+          text: 'Không tìm thấy ảnh nào trong Clipboard. Hãy chụp màn hình (Win + Shift + S / PrtSc) rồi bấm lại hoặc nhấn Ctrl + V.',
+        });
+        return;
+      }
+
+      await processAndAddImageBlobs(imageBlobs, {
+        sourceLabel: 'Clipboard',
+      });
+    } catch {
+      setScanMessage({
+        type: 'error',
+        text: 'Hãy nhấn trực tiếp phím Ctrl + V (hoặc Cmd + V trên Mac) để dán ảnh chụp màn hình vào đây.',
+      });
+    }
+  };
+
+  // Capture computer screen / window / tab directly via Screen Capture API
+  const handleCaptureDesktopScreen = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setScanMessage({
+        type: 'error',
+        text: 'Thiết bị hoặc trình duyệt hiện tại không hỗ trợ chụp màn hình trực tiếp. Hãy chụp màn hình rồi nhấn Ctrl + V.',
+      });
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          displaySurface: 'window',
+        } as any,
+        audio: false,
+      });
+
+      const video = document.createElement('video');
+      video.srcObject = stream;
+      video.muted = true;
+      await video.play();
+
+      // Wait briefly for the first frame to render cleanly
+      await new Promise((resolve) => setTimeout(resolve, 180));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        throw new Error('Không khởi tạo được bộ vẽ ảnh chụp màn hình.');
+      }
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // Stop screen sharing immediately after grabbing the frame
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.92)
+      );
+
+      if (blob) {
+        await processAndAddImageBlobs([blob], {
+          sourceLabel: 'chụp màn hình máy tính',
+        });
+      }
+    } catch (err: any) {
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      const msg = String(err?.message || err || '');
+      if (
+        err?.name === 'NotAllowedError' ||
+        msg.toLowerCase().includes('permission') ||
+        msg.toLowerCase().includes('cancel')
+      ) {
+        return;
+      }
+      setScanMessage({
+        type: 'error',
+        text: 'Không thể chụp màn hình trực tiếp (có thể do giới hạn quyền trình duyệt). Bạn có thể nhấn Win + Shift + S / PrtSc rồi nhấn Ctrl + V vào đây.',
+      });
     }
   };
 
@@ -789,18 +1002,49 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
             />
           </div>
 
-          {/* Requirement 1 & 7: Ảnh chứng từ đính kèm (Chụp camera trực tiếp hoặc Chọn nhiều ảnh từ thư viện, tự động nén 1280px JPEG 0.7) */}
-          <div>
-            <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          {/* Requirement 1 & 7: Ảnh chứng từ đính kèm (Kéo thả, Dán ảnh chụp màn hình Ctrl+V, Chụp màn hình máy tính, Camera hoặc Chọn nhiều ảnh) */}
+          <div
+            onDragOver={handleDragOver}
+            onDragEnter={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDropPhotos}
+            className="space-y-2"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <label className="text-xs font-semibold text-slate-700">
                 Ảnh chứng từ hóa đơn ({images.length})
                 <span className="ml-1.5 text-[10px] font-normal text-slate-400">
-                  (Tự nén ≤1280px, JPEG 0.7)
+                  (Hỗ trợ kéo thả, Ctrl+V dán ảnh chụp màn hình)
                 </span>
               </label>
-              <div className="flex flex-wrap items-center gap-2">
-                <label className="min-h-[44px] text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 active:bg-teal-200 px-3 py-2 rounded-xl border border-teal-200 cursor-pointer flex items-center gap-1.5 transition-colors">
-                  <Camera size={15} className="text-teal-700" />
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={handlePasteFromClipboardButton}
+                  disabled={isCompressingPhotos}
+                  title="Dán ảnh vừa chụp màn hình (Win+Shift+S / PrtSc / Zalo) từ bộ nhớ tạm"
+                  className="min-h-[38px] text-xs font-semibold text-sky-900 bg-sky-50 hover:bg-sky-100 active:bg-sky-200 px-2.5 py-1.5 rounded-xl border border-sky-200 cursor-pointer flex items-center gap-1.5 transition-colors"
+                >
+                  <ClipboardPaste size={14} className="text-sky-700" />
+                  <span>Dán ảnh (Ctrl+V)</span>
+                </button>
+
+                {typeof navigator !== 'undefined' &&
+                  Boolean(navigator.mediaDevices?.getDisplayMedia) && (
+                    <button
+                      type="button"
+                      onClick={handleCaptureDesktopScreen}
+                      disabled={isCompressingPhotos}
+                      title="Chụp trực tiếp cửa sổ hoặc màn hình máy tính để làm ảnh chứng từ"
+                      className="min-h-[38px] text-xs font-semibold text-indigo-900 bg-indigo-50 hover:bg-indigo-100 active:bg-indigo-200 px-2.5 py-1.5 rounded-xl border border-indigo-200 cursor-pointer flex items-center gap-1.5 transition-colors"
+                    >
+                      <Monitor size={14} className="text-indigo-700" />
+                      <span>Chụp màn hình</span>
+                    </button>
+                  )}
+
+                <label className="min-h-[38px] text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 active:bg-teal-200 px-2.5 py-1.5 rounded-xl border border-teal-200 cursor-pointer flex items-center gap-1.5 transition-colors">
+                  <Camera size={14} className="text-teal-700" />
                   <span>Chụp camera</span>
                   <input
                     type="file"
@@ -811,9 +1055,9 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
                   />
                 </label>
 
-                <label className="min-h-[44px] text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200/80 active:bg-slate-300 px-3 py-2 rounded-xl border border-slate-200 cursor-pointer flex items-center gap-1.5 transition-colors">
-                  <Upload size={15} className="text-slate-600" />
-                  <span>Chọn nhiều ảnh</span>
+                <label className="min-h-[38px] text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200/80 active:bg-slate-300 px-2.5 py-1.5 rounded-xl border border-slate-200 cursor-pointer flex items-center gap-1.5 transition-colors">
+                  <Upload size={14} className="text-slate-600" />
+                  <span>Chọn ảnh</span>
                   <input
                     type="file"
                     accept="image/*"
@@ -825,43 +1069,85 @@ export const ExpenseModal: React.FC<ExpenseModalProps> = ({
               </div>
             </div>
 
-            {images.length > 0 ? (
-              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 p-2.5 bg-slate-50 rounded-xl border border-slate-200/80">
-                {images.map((img, idx) => (
-                  <div
-                    key={idx}
-                    className="relative group aspect-square rounded-lg overflow-hidden border border-slate-200 bg-slate-200"
-                  >
-                    <img src={img} alt="Chứng từ" className="w-full h-full object-cover" />
-                    {/* AI Read button on each attached image */}
-                    <button
-                      type="button"
-                      onClick={() => runGeminiReceiptReader(img)}
-                      disabled={isScanning}
-                      className="absolute bottom-1 left-1 right-1 py-1 px-1.5 bg-teal-900/85 hover:bg-teal-800 text-white text-[10px] font-semibold rounded flex items-center justify-center gap-1 backdrop-blur-2xs transition-colors cursor-pointer"
-                      title="Dùng Gemini đọc số tiền, ngày và nội dung từ ảnh này"
-                    >
-                      <Wand2 size={10} />
-                      <span>Đọc hóa đơn AI</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleRemovePhoto(idx)}
-                      className="absolute top-1 right-1 p-1 bg-black/70 hover:bg-rose-600 text-white rounded-md transition-colors cursor-pointer"
-                      title="Xóa ảnh"
-                    >
-                      <Trash2 size={12} />
-                    </button>
+            {/* Dropzone & Paste Area */}
+            <div
+              className={`rounded-xl border-2 border-dashed transition-all p-3 ${
+                isDraggingOver
+                  ? 'border-teal-600 bg-teal-50/80 ring-4 ring-teal-500/15'
+                  : 'border-slate-200 bg-slate-50/80 hover:border-teal-300'
+              }`}
+            >
+              {images.length > 0 ? (
+                <div className="space-y-2.5">
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                    {images.map((img, idx) => (
+                      <div
+                        key={idx}
+                        className="relative group aspect-square rounded-lg overflow-hidden border border-slate-200 bg-slate-200"
+                      >
+                        <img src={img} alt="Chứng từ" className="w-full h-full object-cover" />
+                        {/* AI Read button on each attached image */}
+                        <button
+                          type="button"
+                          onClick={() => runGeminiReceiptReader(img)}
+                          disabled={isScanning}
+                          className="absolute bottom-1 left-1 right-1 py-1 px-1.5 bg-teal-900/85 hover:bg-teal-800 text-white text-[10px] font-semibold rounded flex items-center justify-center gap-1 backdrop-blur-2xs transition-colors cursor-pointer"
+                          title="Dùng Gemini đọc số tiền, ngày và nội dung từ ảnh này"
+                        >
+                          <Wand2 size={10} />
+                          <span>Đọc hóa đơn AI</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRemovePhoto(idx)}
+                          className="absolute top-1 right-1 p-1 bg-black/70 hover:bg-rose-600 text-white rounded-md transition-colors cursor-pointer"
+                          title="Xóa ảnh"
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            ) : (
-              <div className="p-3 bg-slate-50 border border-dashed border-slate-200 rounded-xl text-center">
-                <p className="text-xs text-slate-400">
-                  Chưa có ảnh chứng từ. Nhấn "Chụp camera" hoặc "Chọn nhiều ảnh" để đính kèm.
-                </p>
-              </div>
-            )}
+                  <div className="text-[11px] text-slate-500 text-center pt-1 border-t border-slate-200/70">
+                    {isDraggingOver ? (
+                      <span className="font-bold text-teal-800">
+                        Thả ảnh vào đây để thêm vào danh sách chứng từ...
+                      </span>
+                    ) : (
+                      <span>
+                        Mẹo: Bạn có thể tiếp tục <strong>kéo thả thêm ảnh</strong> vào khung này hoặc nhấn{' '}
+                        <kbd className="px-1.5 py-0.5 bg-white border border-slate-300 rounded text-[10px] font-mono text-slate-700">
+                          Ctrl + V
+                        </kbd>{' '}
+                        để dán ảnh chụp màn hình.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="py-4 px-2 text-center flex flex-col items-center justify-center gap-1.5">
+                  <div
+                    className={`w-9 h-9 rounded-full flex items-center justify-center ${
+                      isDraggingOver
+                        ? 'bg-teal-100 text-teal-700 scale-110'
+                        : 'bg-slate-200/70 text-slate-500'
+                    } transition-all`}
+                  >
+                    <ImagePlus size={18} />
+                  </div>
+                  <p className="text-xs font-semibold text-slate-700">
+                    {isDraggingOver
+                      ? 'Thả ảnh hóa đơn / ảnh chụp màn hình vào đây!'
+                      : isCompressingPhotos
+                      ? 'Đang xử lý & nén ảnh chứng từ...'
+                      : 'Kéo & thả ảnh vào đây, hoặc nhấn Ctrl + V để dán ảnh chụp màn hình'}
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    Hỗ trợ ảnh chụp màn hình máy tính (Win + Shift + S / PrtSc / Zalo), kéo thả file từ máy, hoặc chụp trực tiếp.
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Form Actions */}

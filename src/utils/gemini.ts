@@ -91,6 +91,95 @@ export async function testGeminiApiKey(apiKey: string): Promise<{ success: boole
 }
 
 /**
+ * Sanitizes and pads a base64 string or data URL so it is guaranteed to have valid base64 content length.
+ */
+export function normalizeCleanBase64(input: string): { base64: string; mimeType: string } | null {
+  if (!input || typeof input !== 'string') return null;
+  const trimmed = input.trim();
+  if (!trimmed || /^(https?:|blob:)/i.test(trimmed)) return null;
+
+  let mimeType = 'image/jpeg';
+  let raw = trimmed;
+
+  if (raw.startsWith('data:')) {
+    const commaIdx = raw.indexOf(',');
+    if (commaIdx === -1) return null;
+    const header = raw.slice(5, commaIdx);
+    const mimeMatch = header.match(/^([a-zA-Z0-9/+.-]+)/);
+    if (mimeMatch && mimeMatch[1]) {
+      mimeType = mimeMatch[1].toLowerCase();
+    }
+    raw = raw.slice(commaIdx + 1);
+  }
+
+  let cleaned = raw
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/[^A-Za-z0-9+/=]/g, '')
+    .replace(/=+$/, '');
+
+  if (cleaned.length < 4 || cleaned.length % 4 === 1) {
+    return null;
+  }
+
+  while (cleaned.length % 4 !== 0) {
+    cleaned += '=';
+  }
+
+  return { base64: cleaned, mimeType };
+}
+
+/**
+ * Resolves any image source (data: URL, blob: URL, or http/https URL) into clean base64 + mimeType
+ */
+async function resolveImageInputToCleanBase64(
+  imageInput: string,
+  defaultMime = 'image/jpeg'
+): Promise<{ base64: string; mimeType: string } | null> {
+  const direct = normalizeCleanBase64(imageInput);
+  if (direct) return direct;
+
+  if (!imageInput || !/^(https?:|blob:)/i.test(imageInput.trim())) {
+    return null;
+  }
+
+  const url = imageInput.trim();
+  // 1. Try direct fetch -> compressImage
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const blob = await res.blob();
+      if (blob && blob.size > 0) {
+        const dataUrl = await compressImage(blob, 1280, 0.75);
+        const norm = normalizeCleanBase64(dataUrl);
+        if (norm) return norm;
+      }
+    }
+  } catch {
+    // Fallback to server proxy
+  }
+
+  // 2. Try server proxy endpoint
+  if (/^https?:/i.test(url)) {
+    try {
+      const proxyRes = await fetch(`/api/proxy-image?url=${encodeURIComponent(url)}`);
+      if (proxyRes.ok) {
+        const json = await proxyRes.json();
+        if (json?.success && typeof json.dataUrl === 'string') {
+          const norm = normalizeCleanBase64(json.dataUrl);
+          if (norm) return norm;
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  return null;
+}
+
+/**
  * Requirement 1: Compress an image file or Blob before saving:
  * - Scales the longest edge down to at most ~1280px
  * - Preserves exact original aspect ratio
@@ -104,10 +193,11 @@ export async function compressImage(
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
+      const rawDataUrl = typeof e.target?.result === 'string' ? e.target.result : '';
       const img = new Image();
       img.onload = () => {
-        const naturalW = img.naturalWidth || img.width;
-        const naturalH = img.naturalHeight || img.height;
+        const naturalW = Math.max(1, img.naturalWidth || img.width || 1);
+        const naturalH = Math.max(1, img.naturalHeight || img.height || 1);
         let width = naturalW;
         let height = naturalH;
 
@@ -122,24 +212,46 @@ export async function compressImage(
         }
 
         const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
+        canvas.width = Math.max(1, width);
+        canvas.height = Math.max(1, height);
 
         const ctx = canvas.getContext('2d');
         if (!ctx) {
-          resolve(e.target?.result as string);
+          const norm = normalizeCleanBase64(rawDataUrl);
+          if (norm) {
+            resolve(`data:${norm.mimeType};base64,${norm.base64}`);
+          } else {
+            reject(new Error('Không thể xử lý dữ liệu ảnh'));
+          }
           return;
         }
 
         // Fill white background for transparent PNGs converted to JPEG
         ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, width, height);
-        ctx.drawImage(img, 0, 0, width, height);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        resolve(dataUrl);
+        const norm = normalizeCleanBase64(dataUrl);
+        if (norm) {
+          resolve(`data:image/jpeg;base64,${norm.base64}`);
+        } else {
+          const fallbackNorm = normalizeCleanBase64(rawDataUrl);
+          if (fallbackNorm) {
+            resolve(`data:${fallbackNorm.mimeType};base64,${fallbackNorm.base64}`);
+          } else {
+            reject(new Error('Dữ liệu ảnh sau khi nén không hợp lệ'));
+          }
+        }
       };
-      img.onerror = reject;
-      img.src = e.target?.result as string;
+      img.onerror = () => {
+        const fallbackNorm = normalizeCleanBase64(rawDataUrl);
+        if (fallbackNorm) {
+          resolve(`data:${fallbackNorm.mimeType};base64,${fallbackNorm.base64}`);
+        } else {
+          reject(new Error('Không thể đọc định dạng ảnh này'));
+        }
+      };
+      img.src = rawDataUrl;
     };
     reader.onerror = reject;
     reader.readAsDataURL(file);
@@ -165,6 +277,14 @@ export async function scanReceiptWithAI(imageBase64: string): Promise<{
     };
   }
 
+  const resolvedImg = await resolveImageInputToCleanBase64(imageBase64, 'image/jpeg');
+  if (!resolvedImg) {
+    return {
+      success: false,
+      error: 'Dữ liệu hình ảnh không hợp lệ hoặc không thể tải được. Vui lòng chọn lại ảnh chứng từ.',
+    };
+  }
+
   const userKey = getUserApiKey();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -179,8 +299,8 @@ export async function scanReceiptWithAI(imageBase64: string): Promise<{
       method: 'POST',
       headers,
       body: JSON.stringify({
-        imageBase64,
-        mimeType: 'image/jpeg',
+        imageBase64: resolvedImg.base64,
+        mimeType: resolvedImg.mimeType,
       }),
     });
 
@@ -213,7 +333,7 @@ export async function scanReceiptWithAI(imageBase64: string): Promise<{
   if (userKey) {
     try {
       const ai = new GoogleGenAI({ apiKey: userKey });
-      const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+      const cleanBase64 = resolvedImg.base64;
 
       const promptText = `
 Bạn là chuyên gia kế toán phân tích hóa đơn, phiếu thu, phiếu chi, biên lai, vé tàu xe và chứng từ thanh toán tiếng Việt.
@@ -720,6 +840,18 @@ export async function parseExcelImageWithAI(
     };
   }
 
+  const resolvedImg = await resolveImageInputToCleanBase64(
+    imageBase64,
+    options?.mimeType || 'image/png'
+  );
+  if (!resolvedImg) {
+    return {
+      success: false,
+      data: [],
+      error: 'Không nhận diện được nội dung, vui lòng dán lại hoặc nhập tay',
+    };
+  }
+
   const userKey = getUserApiKey();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -728,7 +860,7 @@ export async function parseExcelImageWithAI(
     headers['x-gemini-api-key'] = userKey;
   }
 
-  const mimeType = options?.mimeType || 'image/png';
+  const mimeType = resolvedImg.mimeType || options?.mimeType || 'image/png';
   const defaultMonthNum = options?.defaultMonthNum || new Date().getMonth() + 1;
   const defaultYear = options?.defaultYear || new Date().getFullYear();
   const unitMode = options?.unitMode || 'thousand';
@@ -738,7 +870,7 @@ export async function parseExcelImageWithAI(
       method: 'POST',
       headers,
       body: JSON.stringify({
-        imageBase64,
+        imageBase64: resolvedImg.base64,
         mimeType,
         defaultMonthNum,
         defaultYear,
@@ -788,7 +920,7 @@ export async function parseExcelImageWithAI(
   if (userKey) {
     try {
       const ai = new GoogleGenAI({ apiKey: userKey });
-      const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+      const cleanBase64 = resolvedImg.base64;
 
       const promptText = `
 Đọc hình ảnh bảng Excel chi tiêu này và trích xuất từng dòng chi tiêu:

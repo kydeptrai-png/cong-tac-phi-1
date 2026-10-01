@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -76,6 +77,75 @@ function getEffectiveApiKey(req: Request): string | undefined {
   return process.env.GEMINI_API_KEY;
 }
 
+/**
+ * Sanitizes and pads a base64 string or data URL on the server so inlineData.data is always valid base64.
+ */
+function sanitizeServerBase64(input: string): string | null {
+  if (!input || typeof input !== 'string') return null;
+  let raw = input.trim();
+  if (!raw || /^(https?:|blob:)/i.test(raw)) return null;
+
+  if (raw.startsWith('data:')) {
+    const commaIdx = raw.indexOf(',');
+    if (commaIdx === -1) return null;
+    raw = raw.slice(commaIdx + 1);
+  }
+
+  let cleaned = raw
+    .replace(/\s+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/')
+    .replace(/[^A-Za-z0-9+/=]/g, '')
+    .replace(/=+$/, '');
+
+  if (cleaned.length < 4 || cleaned.length % 4 === 1) {
+    return null;
+  }
+
+  while (cleaned.length % 4 !== 0) {
+    cleaned += '=';
+  }
+
+  return cleaned;
+}
+
+// API: Proxy external cloud receipt image (Firebase Storage / Google Drive) to Data URL for Excel/PDF export & AI OCR
+app.get('/api/proxy-image', async (req: Request, res: Response) => {
+  try {
+    const targetUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
+    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+      return res.status(400).json({ success: false, error: 'Invalid URL' });
+    }
+
+    const upstream = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; SoChiTieuProxy/1.0)',
+      },
+    });
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({ success: false, error: `Upstream HTTP ${upstream.status}` });
+    }
+
+    const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+    const mimeType = contentType.split(';')[0].trim() || 'image/jpeg';
+    const arrayBuffer = await upstream.arrayBuffer();
+    const base64 = Buffer.from(arrayBuffer).toString('base64');
+
+    if (!base64 || base64.length < 4) {
+      return res.status(422).json({ success: false, error: 'Empty image payload' });
+    }
+
+    return res.json({
+      success: true,
+      mimeType,
+      dataUrl: `data:${mimeType};base64,${base64}`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Proxy fetch failed' });
+  }
+});
+
 // API: Gemini OCR / Smart Receipt Scanner
 app.post('/api/scan-receipt', async (req: Request, res: Response) => {
   try {
@@ -102,8 +172,13 @@ app.post('/api/scan-receipt', async (req: Request, res: Response) => {
       },
     });
 
-    // Strip prefix if present
-    const cleanBase64 = imageBase64.replace(/^data:image\/[a-z]+;base64,/, '');
+    const cleanBase64 = sanitizeServerBase64(String(imageBase64));
+    if (!cleanBase64) {
+      return res.status(400).json({
+        success: false,
+        error: 'Dữ liệu hình ảnh chứng từ không hợp lệ (bad base64 content).',
+      });
+    }
 
     const promptText = `
 Bạn là chuyên gia phân tích hóa đơn, phiếu thu, phiếu chi, biên lai, vé tàu xe và chứng từ thanh toán tiếng Việt.
@@ -430,7 +505,13 @@ app.post('/api/parse-excel-image', async (req: Request, res: Response) => {
       },
     });
 
-    const cleanBase64 = String(imageBase64).replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+    const cleanBase64 = sanitizeServerBase64(String(imageBase64));
+    if (!cleanBase64) {
+      return res.status(400).json({
+        success: false,
+        error: 'Không nhận diện được nội dung hình ảnh, vui lòng dán lại hoặc nhập tay',
+      });
+    }
     const fallbackMonth = Number(defaultMonthNum) >= 1 && Number(defaultMonthNum) <= 12
       ? Number(defaultMonthNum)
       : new Date().getMonth() + 1;
@@ -617,6 +698,314 @@ app.get('/fonts/:fontName', async (req: Request, res: Response) => {
 
 // Static files from public folder (icons, manifest, sw)
 app.use(express.static(path.resolve(__dirname, 'public')));
+
+// ============================================================================
+// REAL-TIME LAN / P2P SYNC SIGNALING & RELAY ROOMS (/api/lan-sync/*)
+// ============================================================================
+interface ServerLanPeer {
+  peerId: string;
+  deviceName: string;
+  deviceType: 'pc' | 'mobile';
+  joinedAt: number;
+  lastSeen: number;
+  sseRes?: Response;
+}
+
+interface ServerLanRoom {
+  roomCode: string;
+  peers: Map<string, ServerLanPeer>;
+  messages: Array< any >;
+}
+
+const lanRooms = new Map<string, ServerLanRoom>();
+
+function setLanCors(res: Response) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+app.options('/api/lan-sync/*', (_req: Request, res: Response) => {
+  setLanCors(res);
+  res.status(204).end();
+});
+
+function getOrCreateLanRoom(roomCode: string): ServerLanRoom {
+  let room = lanRooms.get(roomCode);
+  if (!room) {
+    room = {
+      roomCode,
+      peers: new Map(),
+      messages: [],
+    };
+    lanRooms.set(roomCode, room);
+  }
+  return room;
+}
+
+function getSerializablePeers(room: ServerLanRoom) {
+  const now = Date.now();
+  const list: Array<{
+    peerId: string;
+    deviceName: string;
+    deviceType: 'pc' | 'mobile';
+    joinedAt: number;
+    lastSeen: number;
+  }> = [];
+  for (const [peerId, p] of room.peers.entries()) {
+    // Prune peers silent for > 25s without active SSE
+    if (!p.sseRes && now - p.lastSeen > 25000) {
+      room.peers.delete(peerId);
+      continue;
+    }
+    list.push({
+      peerId: p.peerId,
+      deviceName: p.deviceName,
+      deviceType: p.deviceType,
+      joinedAt: p.joinedAt,
+      lastSeen: p.lastSeen,
+    });
+  }
+  return list;
+}
+
+function broadcastToLanRoom(room: ServerLanRoom, payload: any, excludePeerId?: string) {
+  const str = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const [peerId, peer] of room.peers.entries()) {
+    if (excludePeerId && peerId === excludePeerId) continue;
+    if (peer.sseRes) {
+      try {
+        peer.sseRes.write(str);
+      } catch {
+        peer.sseRes = undefined;
+      }
+    }
+  }
+}
+
+app.get('/api/lan-sync/info', (_req: Request, res: Response) => {
+  setLanCors(res);
+  const ips: string[] = [];
+  try {
+    const nets = os.networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const net of nets[name] || []) {
+        if (net.family === 'IPv4' && !net.internal) {
+          ips.push(net.address);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return res.json({
+    success: true,
+    port: PORT,
+    lanIps: ips,
+  });
+});
+
+app.get('/api/lan-sync/stream', (req: Request, res: Response) => {
+  setLanCors(res);
+  const roomCode = String(req.query.roomCode || '').trim();
+  const peerId = String(req.query.peerId || '').trim();
+  const deviceName = String(req.query.deviceName || 'Thiết bị LAN').trim();
+  const deviceType = req.query.deviceType === 'mobile' ? 'mobile' : 'pc';
+
+  if (!roomCode || !peerId) {
+    return res.status(400).json({ error: 'Missing roomCode or peerId' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const room = getOrCreateLanRoom(roomCode);
+  const now = Date.now();
+  const existing = room.peers.get(peerId);
+  const peerObj: ServerLanPeer = {
+    peerId,
+    deviceName,
+    deviceType,
+    joinedAt: existing?.joinedAt || now,
+    lastSeen: now,
+    sseRes: res,
+  };
+  room.peers.set(peerId, peerObj);
+
+  // Send initial room state to newly connected peer
+  res.write(
+    `data: ${JSON.stringify({
+      type: 'room:state',
+      peers: getSerializablePeers(room),
+    })}\n\n`
+  );
+
+  // Notify other peers in room
+  broadcastToLanRoom(
+    room,
+    {
+      type: 'peer:joined',
+      peer: {
+        peerId,
+        deviceName,
+        deviceType,
+        joinedAt: peerObj.joinedAt,
+        lastSeen: now,
+      },
+    },
+    peerId
+  );
+
+  const heartbeat = setInterval(() => {
+    try {
+      peerObj.lastSeen = Date.now();
+      res.write(': ping\n\n');
+    } catch {
+      clearInterval(heartbeat);
+    }
+  }, 15000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const current = room.peers.get(peerId);
+    if (current && current.sseRes === res) {
+      current.sseRes = undefined;
+      current.lastSeen = Date.now();
+      // Give 5s grace period in case of quick reconnect or poll mode
+      setTimeout(() => {
+        const check = room.peers.get(peerId);
+        if (check && !check.sseRes && Date.now() - check.lastSeen >= 4500) {
+          room.peers.delete(peerId);
+          broadcastToLanRoom(room, { type: 'peer:left', peerId }, peerId);
+          if (room.peers.size === 0 && room.messages.length === 0) {
+            lanRooms.delete(roomCode);
+          }
+        }
+      }, 5000);
+    }
+  });
+});
+
+app.get('/api/lan-sync/poll', (req: Request, res: Response) => {
+  setLanCors(res);
+  const roomCode = String(req.query.roomCode || '').trim();
+  const peerId = String(req.query.peerId || '').trim();
+  const deviceName = String(req.query.deviceName || 'Thiết bị LAN').trim();
+  const deviceType = req.query.deviceType === 'mobile' ? 'mobile' : 'pc';
+  const since = Number(req.query.since || 0);
+
+  if (!roomCode || !peerId) {
+    return res.status(400).json({ error: 'Missing roomCode or peerId' });
+  }
+
+  const room = getOrCreateLanRoom(roomCode);
+  const now = Date.now();
+  const existing = room.peers.get(peerId);
+  if (!existing) {
+    const newPeer: ServerLanPeer = {
+      peerId,
+      deviceName,
+      deviceType,
+      joinedAt: now,
+      lastSeen: now,
+    };
+    room.peers.set(peerId, newPeer);
+    broadcastToLanRoom(
+      room,
+      {
+        type: 'peer:joined',
+        peer: {
+          peerId,
+          deviceName,
+          deviceType,
+          joinedAt: now,
+          lastSeen: now,
+        },
+      },
+      peerId
+    );
+  } else {
+    existing.lastSeen = now;
+    existing.deviceName = deviceName || existing.deviceName;
+  }
+
+  // Prune messages older than 60s
+  room.messages = room.messages.filter((m) => now - m.timestamp < 60000);
+
+  const pending = room.messages.filter(
+    (m) =>
+      m.timestamp > since &&
+      m.senderPeerId !== peerId &&
+      (!m.targetPeerId || m.targetPeerId === peerId)
+  );
+
+  return res.json({
+    success: true,
+    peers: getSerializablePeers(room),
+    messages: pending,
+  });
+});
+
+app.post('/api/lan-sync/send', (req: Request, res: Response) => {
+  setLanCors(res);
+  const { roomCode, envelope } = req.body || {};
+  if (!roomCode || !envelope || !envelope.messageId) {
+    return res.status(400).json({ error: 'Invalid LAN sync payload' });
+  }
+
+  const cleanRoomCode = String(roomCode).trim();
+  const room = getOrCreateLanRoom(cleanRoomCode);
+  const now = Date.now();
+  envelope.timestamp = now;
+
+  // Keep rolling message buffer (max 40 recent messages, < 60s)
+  room.messages.push(envelope);
+  if (room.messages.length > 40) {
+    room.messages.shift();
+  }
+
+  // Update sender lastSeen
+  const sender = room.peers.get(envelope.senderPeerId);
+  if (sender) {
+    sender.lastSeen = now;
+  }
+
+  // Push immediately over SSE to matching peers
+  for (const [peerId, peer] of room.peers.entries()) {
+    if (peerId === envelope.senderPeerId) continue;
+    if (envelope.targetPeerId && envelope.targetPeerId !== peerId) continue;
+    if (peer.sseRes) {
+      try {
+        peer.sseRes.write(
+          `data: ${JSON.stringify({
+            type: 'envelope',
+            envelope,
+          })}\n\n`
+        );
+      } catch {
+        peer.sseRes = undefined;
+      }
+    }
+  }
+
+  return res.json({ success: true, timestamp: now });
+});
+
+app.post('/api/lan-sync/leave', (req: Request, res: Response) => {
+  setLanCors(res);
+  const { roomCode, peerId } = req.body || {};
+  if (roomCode && peerId) {
+    const room = lanRooms.get(String(roomCode).trim());
+    if (room) {
+      room.peers.delete(String(peerId));
+      broadcastToLanRoom(room, { type: 'peer:left', peerId: String(peerId) }, String(peerId));
+    }
+  }
+  return res.json({ success: true });
+});
 
 // Setup Vite in Dev or static files in Production
 async function startServer() {

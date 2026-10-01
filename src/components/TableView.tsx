@@ -1,7 +1,10 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Camera,
   Image as ImageIcon,
+  ImagePlus,
+  Upload,
+  ClipboardPaste,
   Edit2,
   Trash2,
   Plus,
@@ -27,6 +30,11 @@ interface TableViewProps {
   onDeleteExpense: (id: string) => void;
   onOpenReceiptViewer: (expense: ExpenseItem) => void;
   onAddNewToMonth: (monthTitle: string) => void;
+  onDropFilesOnExpense?: (expense: ExpenseItem, files: File[]) => Promise<void> | void;
+  onPasteClipboardToExpense?: (expense: ExpenseItem) => Promise<void> | void;
+  onHoverExpense?: (expenseId: string | null) => void;
+  uploadingExpenseId?: string | null;
+  isGlobalDraggingFiles?: boolean;
   grandTotal: number;
   totalExpensesCount: number;
   duplicateIdsSet: Set<string>;
@@ -52,6 +60,11 @@ export const TableView: React.FC<TableViewProps> = ({
   onDeleteExpense,
   onOpenReceiptViewer,
   onAddNewToMonth,
+  onDropFilesOnExpense,
+  onPasteClipboardToExpense,
+  onHoverExpense,
+  uploadingExpenseId = null,
+  isGlobalDraggingFiles = false,
   grandTotal,
   totalExpensesCount,
   duplicateIdsSet,
@@ -70,6 +83,31 @@ export const TableView: React.FC<TableViewProps> = ({
   onCollapseAllMonths,
   onExpandAllMonths,
 }) => {
+  const [dragOverExpenseId, setDragOverExpenseId] = useState<string | null>(null);
+
+  const extractImageFilesFromDataTransfer = (dt: DataTransfer | null): File[] => {
+    if (!dt) return [];
+    const files: File[] = [];
+    if (dt.files && dt.files.length > 0) {
+      for (let i = 0; i < dt.files.length; i++) {
+        const f = dt.files[i];
+        if (f.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|heic)$/i.test(f.name)) {
+          files.push(f);
+        }
+      }
+    }
+    if (files.length === 0 && dt.items && dt.items.length > 0) {
+      for (let i = 0; i < dt.items.length; i++) {
+        const item = dt.items[i];
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+    }
+    return files;
+  };
+
   const settledInViewCount = monthGroups.filter((g) =>
     settledMonthKeys.has(g.monthKey)
   ).length;
@@ -96,11 +134,17 @@ export const TableView: React.FC<TableViewProps> = ({
             <span>
               {onlyMissingReceipts ? (
                 <>
-                  Đang lọc hiển thị <strong>{totalExpensesCount} khoản chi chưa có ảnh chứng từ</strong>.
+                  Đang lọc hiển thị <strong>{totalExpensesCount} khoản chi chưa có ảnh chứng từ</strong>.{' '}
+                  <span className="hidden md:inline text-amber-800">
+                    (Kéo thả ảnh trực tiếp vào dòng bất kỳ hoặc bấm nút Dán ảnh / Ctrl+V)
+                  </span>
                 </>
               ) : (
                 <>
-                  Hiện có <strong>{missingReceiptsCount} khoản chi chưa có ảnh chứng từ</strong> trong danh sách.
+                  Hiện có <strong>{missingReceiptsCount} khoản chi chưa có ảnh chứng từ</strong> trong danh sách.{' '}
+                  <span className="hidden md:inline text-amber-800">
+                    (Có thể kéo thả ảnh trực tiếp vào từng dòng ở ngoài bảng)
+                  </span>
                 </>
               )}
             </span>
@@ -367,7 +411,9 @@ export const TableView: React.FC<TableViewProps> = ({
                           <th className="py-2.5 px-3 sm:px-4 w-28">Ngày</th>
                           <th className="py-2.5 px-3 sm:px-4 min-w-[200px]">Diễn giải</th>
                           <th className="py-2.5 px-3 sm:px-4 w-32 text-right">Số tiền</th>
-                          <th className="py-2.5 px-3 sm:px-4 w-32 text-center">Chứng từ</th>
+                          <th className="py-2.5 px-3 sm:px-4 w-44 text-center">
+                            Chứng từ (Kéo thả / Dán)
+                          </th>
                           <th className="py-2.5 px-3 sm:px-4 w-24 text-center">Thao tác</th>
                         </tr>
                       </thead>
@@ -377,12 +423,52 @@ export const TableView: React.FC<TableViewProps> = ({
                           const isRefund = item.amount < 0;
                           const isSuspectedDuplicate = duplicateIdsSet.has(item.id);
                           const isSelected = selectedIds.has(item.id);
+                          const isDragOverRow = dragOverExpenseId === item.id;
+                          const isUploadingThisRow = uploadingExpenseId === item.id;
 
                           return (
                             <tr
                               key={item.id}
-                              className={`transition-colors group ${
-                                isSelected
+                              onMouseEnter={() => onHoverExpense?.(item.id)}
+                              onMouseLeave={() => onHoverExpense?.(null)}
+                              onDragEnter={(e) => {
+                                if (!onDropFilesOnExpense) return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setDragOverExpenseId(item.id);
+                              }}
+                              onDragOver={(e) => {
+                                if (!onDropFilesOnExpense) return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                e.dataTransfer.dropEffect = 'copy';
+                                if (dragOverExpenseId !== item.id) {
+                                  setDragOverExpenseId(item.id);
+                                }
+                              }}
+                              onDragLeave={(e) => {
+                                if (!onDropFilesOnExpense) return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                const related = e.relatedTarget as Node | null;
+                                if (!related || !e.currentTarget.contains(related)) {
+                                  setDragOverExpenseId((prev) => (prev === item.id ? null : prev));
+                                }
+                              }}
+                              onDrop={(e) => {
+                                if (!onDropFilesOnExpense) return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                setDragOverExpenseId(null);
+                                const files = extractImageFilesFromDataTransfer(e.dataTransfer);
+                                if (files.length > 0) {
+                                  onDropFilesOnExpense(item, files);
+                                }
+                              }}
+                              className={`transition-all group ${
+                                isDragOverRow
+                                  ? 'bg-teal-100/90 ring-2 ring-teal-600 ring-inset shadow-xs'
+                                  : isSelected
                                   ? 'bg-teal-100/60 hover:bg-teal-100/80'
                                   : isSuspectedDuplicate
                                   ? 'bg-amber-50/45 hover:bg-amber-50/80'
@@ -452,34 +538,77 @@ export const TableView: React.FC<TableViewProps> = ({
                                 {formatVND(item.amount)}
                               </td>
 
-                              {/* Requirement 2: Ảnh chứng từ (dòng thiếu ảnh có biểu tượng cảnh báo) */}
+                              {/* Requirement 2 & Drop Outside: Ảnh chứng từ (hỗ trợ kéo thả trực tiếp & dán ảnh ở ngoài) */}
                               <td className="py-2 px-2 text-center whitespace-nowrap">
-                                <button
-                                  onClick={() => onOpenReceiptViewer(item)}
-                                  title={
-                                    hasImages
-                                      ? `Xem ${item.images.length} ảnh chứng từ`
-                                      : 'Chưa có ảnh chứng từ — Bấm để chụp hoặc thêm ảnh'
-                                  }
-                                  className={`min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
-                                    hasImages
-                                      ? 'bg-teal-50 text-teal-700 hover:bg-teal-100 active:bg-teal-200 border border-teal-200'
-                                      : 'bg-amber-50/80 text-amber-800 hover:bg-amber-100 active:bg-amber-200 border border-amber-200/90'
-                                  }`}
-                                >
-                                  {hasImages ? (
-                                    <>
-                                      <ImageIcon size={15} className="text-teal-600" />
-                                      <span className="font-semibold">{item.images.length}</span>
-                                    </>
-                                  ) : (
-                                    <>
-                                      <AlertTriangle size={14} className="text-amber-600 shrink-0" />
-                                      <Camera size={14} className="text-amber-700 shrink-0" />
-                                      <span className="text-[11px] font-semibold">Thiếu ảnh</span>
-                                    </>
-                                  )}
-                                </button>
+                                {isUploadingThisRow ? (
+                                  <div className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-teal-50 text-teal-800 border border-teal-300">
+                                    <div className="w-3.5 h-3.5 border-2 border-teal-700 border-t-transparent rounded-full animate-spin shrink-0" />
+                                    <span>Đang lưu ảnh...</span>
+                                  </div>
+                                ) : isDragOverRow ? (
+                                  <div className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-teal-700 text-white border-2 border-dashed border-white shadow-sm animate-pulse">
+                                    <Upload size={14} className="shrink-0" />
+                                    <span>Thả ảnh vào đây</span>
+                                  </div>
+                                ) : (
+                                  <div className="inline-flex items-center justify-center gap-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => onOpenReceiptViewer(item)}
+                                      title={
+                                        hasImages
+                                          ? `Xem ${item.images.length} ảnh chứng từ (Hoặc kéo thả thêm ảnh trực tiếp vào dòng này)`
+                                          : 'Chưa có ảnh chứng từ — Bấm để xem/thêm hoặc Kéo thả ảnh trực tiếp vào dòng này'
+                                      }
+                                      className={`min-h-[40px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                                        isGlobalDraggingFiles
+                                          ? 'bg-teal-50 text-teal-900 border-2 border-dashed border-teal-500 shadow-2xs'
+                                          : hasImages
+                                          ? 'bg-teal-50 text-teal-700 hover:bg-teal-100 active:bg-teal-200 border border-teal-200'
+                                          : 'bg-amber-50/80 text-amber-800 hover:bg-amber-100 active:bg-amber-200 border border-dashed border-amber-300'
+                                      }`}
+                                    >
+                                      {isGlobalDraggingFiles ? (
+                                        <>
+                                          <ImagePlus size={14} className="text-teal-700 shrink-0" />
+                                          <span className="text-[11px] font-bold">
+                                            {hasImages ? `${item.images.length} • Thả thêm` : 'Thả ảnh vào đây'}
+                                          </span>
+                                        </>
+                                      ) : hasImages ? (
+                                        <>
+                                          <ImageIcon size={15} className="text-teal-600" />
+                                          <span className="font-semibold">{item.images.length}</span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <AlertTriangle size={13} className="text-amber-600 shrink-0" />
+                                          <Camera size={13} className="text-amber-700 shrink-0" />
+                                          <span className="text-[11px] font-semibold">Thiếu ảnh</span>
+                                        </>
+                                      )}
+                                    </button>
+
+                                    {onPasteClipboardToExpense && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          onPasteClipboardToExpense(item);
+                                        }}
+                                        title="Dán nhanh ảnh chụp màn hình từ bộ nhớ tạm vào khoản chi này (hoặc chỉ chuột vào dòng rồi bấm Ctrl+V)"
+                                        className={`min-h-[40px] min-w-[36px] px-2 py-1.5 rounded-xl text-xs font-semibold inline-flex items-center justify-center gap-1 border transition-all cursor-pointer ${
+                                          hasImages
+                                            ? 'bg-slate-50 hover:bg-indigo-50 text-slate-500 hover:text-indigo-700 border-slate-200 hover:border-indigo-200 opacity-70 group-hover:opacity-100'
+                                            : 'bg-indigo-50/80 hover:bg-indigo-100 text-indigo-800 border-indigo-200/80'
+                                        }`}
+                                      >
+                                        <ClipboardPaste size={13} className="shrink-0" />
+                                        <span className="hidden xl:inline text-[10px]">Dán</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
                               </td>
 
                               {/* Thao tác */}

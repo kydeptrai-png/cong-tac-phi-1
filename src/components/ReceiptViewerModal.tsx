@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   X,
   ChevronLeft,
@@ -11,6 +11,8 @@ import {
   Wand2,
   Check,
   AlertCircle,
+  ClipboardPaste,
+  Monitor,
 } from 'lucide-react';
 import { ExpenseItem, ReceiptScanResult } from '../types';
 import { formatVND } from '../utils/categories';
@@ -35,15 +37,76 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isCompressing, setIsCompressing] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [scanResult, setScanResult] = useState<ReceiptScanResult | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
+  const [infoNotice, setInfoNotice] = useState<string | null>(null);
 
-  if (!isOpen || !expense) return null;
-
-  const images = expense.images || [];
+  const images = expense?.images || [];
   const hasImages = images.length > 0;
   const safeIdx = hasImages ? Math.min(currentIndex, images.length - 1) : 0;
   const currentImage = hasImages ? images[safeIdx] : null;
+
+  const processAndAppendBlobs = useCallback(
+    async (blobs: Array<File | Blob>, sourceLabel?: string) => {
+      if (!expense || !blobs || blobs.length === 0) return;
+      setIsCompressing(true);
+      setScanError(null);
+      setInfoNotice(null);
+
+      const compressedList: string[] = [];
+      for (let i = 0; i < blobs.length; i++) {
+        try {
+          const compressedDataUrl = await compressImage(blobs[i], 1280, 0.7);
+          compressedList.push(compressedDataUrl);
+        } catch (err) {
+          console.error('Lỗi khi nén ảnh chứng từ:', err);
+        }
+      }
+
+      setIsCompressing(false);
+
+      if (compressedList.length > 0) {
+        const currentImgs = expense.images || [];
+        const newImages = [...currentImgs, ...compressedList];
+        onUpdateImages(expense.id, newImages);
+        setCurrentIndex(newImages.length - 1);
+        if (sourceLabel) {
+          setInfoNotice(`Đã thêm ${compressedList.length} ảnh từ ${sourceLabel}.`);
+        }
+      }
+    },
+    [expense, onUpdateImages]
+  );
+
+  // Listen for Ctrl+V / Cmd+V screenshot paste while ReceiptViewerModal is open
+  useEffect(() => {
+    if (!isOpen || !expense) return;
+
+    const handlePaste = (e: ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageBlobs: Blob[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith('image/')) {
+          const blob = item.getAsFile();
+          if (blob) imageBlobs.push(blob);
+        }
+      }
+
+      if (imageBlobs.length > 0) {
+        e.preventDefault();
+        processAndAppendBlobs(imageBlobs, 'ảnh chụp màn hình (Ctrl+V)');
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [isOpen, expense, processAndAppendBlobs]);
+
+  if (!isOpen || !expense) return null;
 
   const handleNext = () => {
     if (safeIdx < images.length - 1) {
@@ -76,27 +139,118 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
   const handleAddImages = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
+    const fileList = Array.from(files);
+    e.target.value = '';
+    await processAndAppendBlobs(fileList);
+  };
 
-    setIsCompressing(true);
-    setScanError(null);
-    const compressedList: string[] = [];
+  // Drag & Drop handlers
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isDraggingOver) setIsDraggingOver(true);
+  };
 
-    for (let i = 0; i < files.length; i++) {
-      try {
-        const compressedDataUrl = await compressImage(files[i], 1280, 0.7);
-        compressedList.push(compressedDataUrl);
-      } catch (err) {
-        console.error('Lỗi khi nén ảnh chứng từ:', err);
-      }
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  };
+
+  const handleDropImages = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+
+    const droppedFiles = e.dataTransfer?.files;
+    if (!droppedFiles || droppedFiles.length === 0) return;
+
+    const imageFiles = Array.from(droppedFiles).filter((f) => f.type.startsWith('image/'));
+    if (imageFiles.length === 0) {
+      setScanError('File vừa thả không phải định dạng ảnh hợp lệ.');
+      return;
     }
 
-    e.target.value = '';
-    setIsCompressing(false);
+    await processAndAppendBlobs(imageFiles, 'kéo thả file');
+  };
 
-    if (compressedList.length > 0) {
-      const newImages = [...images, ...compressedList];
-      onUpdateImages(expense.id, newImages);
-      setCurrentIndex(newImages.length - 1);
+  const handlePasteClipboardClick = async () => {
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.read) {
+        setScanError('Hãy nhấn tổ hợp phím Ctrl + V (hoặc Cmd + V) để dán ảnh vừa chụp màn hình!');
+        return;
+      }
+
+      const clipboardItems = await navigator.clipboard.read();
+      const imageBlobs: Blob[] = [];
+
+      for (const item of clipboardItems) {
+        const imgType = item.types.find((t) => t.startsWith('image/'));
+        if (imgType) {
+          const blob = await item.getType(imgType);
+          if (blob) imageBlobs.push(blob);
+        }
+      }
+
+      if (imageBlobs.length === 0) {
+        setScanError('Không có ảnh trong Clipboard. Hãy chụp màn hình (Win+Shift+S / PrtSc) rồi nhấn Ctrl + V.');
+        return;
+      }
+
+      await processAndAppendBlobs(imageBlobs, 'Clipboard');
+    } catch {
+      setScanError('Hãy nhấn trực tiếp Ctrl + V trên bàn phím để dán ảnh chụp màn hình vào đây.');
+    }
+  };
+
+  const handleCaptureDesktopScreen = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      setScanError('Trình duyệt không hỗ trợ chụp màn hình trực tiếp. Hãy dùng Win+Shift+S rồi nhấn Ctrl+V.');
+      return;
+    }
+
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: 'window' } as any,
+        audio: false,
+      });
+
+      const video = document.createElement('video');
+      video.srcObject = stream;
+      video.muted = true;
+      await video.play();
+      await new Promise((resolve) => setTimeout(resolve, 180));
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas error');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/jpeg', 0.92)
+      );
+      if (blob) {
+        await processAndAppendBlobs([blob], 'chụp màn hình máy tính');
+      }
+    } catch (err: any) {
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+      const msg = String(err?.message || err || '');
+      if (
+        err?.name === 'NotAllowedError' ||
+        msg.toLowerCase().includes('permission') ||
+        msg.toLowerCase().includes('cancel')
+      ) {
+        return;
+      }
+      setScanError('Không thể chụp màn hình trực tiếp. Hãy nhấn Win+Shift+S / PrtSc rồi nhấn Ctrl + V vào đây.');
     }
   };
 
@@ -203,6 +357,13 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
           </div>
         )}
 
+        {infoNotice && (
+          <div className="px-5 py-2 bg-emerald-50 border-b border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
+            <Check size={14} className="text-emerald-600 shrink-0" />
+            <span>{infoNotice}</span>
+          </div>
+        )}
+
         {scanError && (
           <div className="px-5 py-2.5 bg-rose-50 border-b border-rose-200 text-rose-800 text-xs flex items-center gap-2">
             <AlertCircle size={15} className="text-rose-600 shrink-0" />
@@ -210,8 +371,23 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
           </div>
         )}
 
-        {/* Content Body */}
-        <div className="relative flex-1 bg-slate-950 flex items-center justify-center min-h-[300px] max-h-[56vh] select-none overflow-hidden">
+        {/* Content Body (Supports Drag & Drop and Ctrl+V Paste) */}
+        <div
+          onDragOver={handleDragOver}
+          onDragEnter={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDropImages}
+          className={`relative flex-1 bg-slate-950 flex items-center justify-center min-h-[300px] max-h-[56vh] select-none overflow-hidden transition-all ${
+            isDraggingOver ? 'ring-4 ring-inset ring-teal-400 bg-slate-900' : ''
+          }`}
+        >
+          {isDraggingOver && (
+            <div className="absolute inset-4 z-20 rounded-2xl border-2 border-dashed border-teal-400 bg-teal-950/80 backdrop-blur-xs flex flex-col items-center justify-center text-white p-4 text-center pointer-events-none">
+              <Upload size={32} className="text-teal-300 mb-2 animate-bounce" />
+              <p className="text-sm font-bold">Thả ảnh vào đây để đính kèm vào chứng từ</p>
+              <p className="text-xs text-teal-200 mt-0.5">Tự động nén ≤1280px, JPEG 0.7</p>
+            </div>
+          )}
           {hasImages && currentImage ? (
             <>
               <img
@@ -251,9 +427,11 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
           ) : (
             <div className="flex flex-col items-center justify-center p-8 text-center text-slate-400">
               <Receipt size={48} className="text-slate-600 mb-3 stroke-[1.5]" />
-              <p className="text-sm font-medium text-slate-300">Chưa có ảnh chứng từ nào</p>
-              <p className="text-xs text-slate-500 mt-1 max-w-xs">
-                Bạn có thể chụp ảnh trực tiếp bằng camera hoặc chọn nhiều ảnh từ thư viện (tự động nén ≤1280px, JPEG 0.7)
+              <p className="text-sm font-medium text-slate-300">
+                Chưa có ảnh chứng từ nào — Kéo thả ảnh hoặc nhấn Ctrl + V để dán ảnh chụp màn hình
+              </p>
+              <p className="text-xs text-slate-500 mt-1 max-w-md">
+                Hỗ trợ kéo thả file ảnh từ máy tính, dán ảnh chụp màn hình (Win + Shift + S / PrtSc / Ctrl + V), chụp màn hình trực tiếp hoặc chọn nhiều ảnh từ thư viện.
               </p>
             </div>
           )}
@@ -261,10 +439,37 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
 
         {/* Bottom Actions Bar */}
         <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3.5 bg-slate-50 border-t border-slate-100">
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Dán ảnh chụp màn hình (Ctrl+V) */}
+            <button
+              type="button"
+              onClick={handlePasteClipboardClick}
+              disabled={isCompressing}
+              className="min-h-[40px] flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-sky-900 bg-sky-50 hover:bg-sky-100 active:bg-sky-200 rounded-xl border border-sky-200 cursor-pointer transition-colors"
+              title="Dán ảnh chụp màn hình từ Clipboard (hoặc nhấn Ctrl+V)"
+            >
+              <ClipboardPaste size={15} className="text-sky-700" />
+              <span>Dán ảnh (Ctrl+V)</span>
+            </button>
+
+            {/* Chụp màn hình máy tính */}
+            {typeof navigator !== 'undefined' &&
+              Boolean(navigator.mediaDevices?.getDisplayMedia) && (
+                <button
+                  type="button"
+                  onClick={handleCaptureDesktopScreen}
+                  disabled={isCompressing}
+                  className="min-h-[40px] flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-indigo-900 bg-indigo-50 hover:bg-indigo-100 active:bg-indigo-200 rounded-xl border border-indigo-200 cursor-pointer transition-colors"
+                  title="Chụp trực tiếp cửa sổ hoặc màn hình máy tính"
+                >
+                  <Monitor size={15} className="text-indigo-700" />
+                  <span>Chụp màn hình</span>
+                </button>
+              )}
+
             {/* Chụp trực tiếp bằng Camera */}
-            <label className="min-h-[44px] flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 active:bg-teal-900 rounded-xl cursor-pointer transition-colors shadow-2xs">
-              <Camera size={16} />
+            <label className="min-h-[40px] flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-teal-700 hover:bg-teal-800 active:bg-teal-900 rounded-xl cursor-pointer transition-colors shadow-2xs">
+              <Camera size={15} />
               <span>{isCompressing ? 'Đang nén...' : 'Chụp camera'}</span>
               <input
                 type="file"
@@ -277,9 +482,9 @@ export const ReceiptViewerModal: React.FC<ReceiptViewerModalProps> = ({
             </label>
 
             {/* Chọn nhiều ảnh từ thư viện */}
-            <label className="min-h-[44px] flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 active:bg-teal-200 rounded-xl cursor-pointer transition-colors border border-teal-200">
-              <Upload size={16} />
-              <span>Chọn nhiều ảnh</span>
+            <label className="min-h-[40px] flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-teal-800 bg-teal-50 hover:bg-teal-100 active:bg-teal-200 rounded-xl cursor-pointer transition-colors border border-teal-200">
+              <Upload size={15} />
+              <span>Chọn ảnh</span>
               <input
                 type="file"
                 accept="image/*"

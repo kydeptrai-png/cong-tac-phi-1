@@ -11,6 +11,7 @@ import {
   AlertCircle,
   LogOut,
   Database,
+  Wifi,
 } from 'lucide-react';
 import { GoogleDriveUser, DriveErrorCode } from '../utils/googleDrive';
 import { RealtimeSyncStatus } from '../utils/cloudSync';
@@ -40,6 +41,10 @@ interface AutoBackupBarProps {
   onGoogleLogout: () => void;
   onOpenDriveSyncModal: () => void;
   onQuickSyncDriveNow: () => void;
+  onOpenLanSyncModal?: () => void;
+  lanConnected?: boolean;
+  lanRoomCode?: string;
+  lanPeersCount?: number;
 }
 
 export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
@@ -59,6 +64,10 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
   onGoogleLogout,
   onOpenDriveSyncModal,
   onQuickSyncDriveNow,
+  onOpenLanSyncModal,
+  lanConnected = false,
+  lanRoomCode = '',
+  lanPeersCount = 0,
 }) => {
   const isSignedIn = Boolean(driveUser?.uid);
   const isDriveConnected = Boolean(driveUser && hasActiveToken);
@@ -126,6 +135,26 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
                 {driveUser?.email || driveUser?.displayName || 'Tài khoản Google'}
               </span>
             </div>
+          )}
+
+          {onOpenLanSyncModal && (
+            <button
+              type="button"
+              onClick={onOpenLanSyncModal}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                lanConnected
+                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs'
+                  : 'bg-teal-50 hover:bg-teal-100 text-teal-900 border border-teal-200'
+              }`}
+              title="Đồng bộ trực tiếp giữa các thiết bị qua mạng LAN / Mã 6 số thời gian thực"
+            >
+              <Wifi size={13} />
+              <span>
+                {lanConnected
+                  ? `LAN #${lanRoomCode} (${lanPeersCount} máy đang nối)`
+                  : 'Đồng bộ LAN (Mã 6 số)'}
+              </span>
+            </button>
           )}
 
           {/* Secondary Status Text */}
