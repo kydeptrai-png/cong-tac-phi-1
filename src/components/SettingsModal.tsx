@@ -62,6 +62,7 @@ interface SettingsModalProps {
   driveUser: GoogleDriveUser | null;
   hasActiveToken: boolean;
   needsReauth: boolean;
+  isSigningIn?: boolean;
   autoDriveSyncEnabled: boolean;
   onToggleAutoDriveSync: (enabled: boolean) => void;
   driveSyncStatus: 'idle' | 'syncing' | 'synced' | 'error';
@@ -84,6 +85,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   driveUser,
   hasActiveToken,
   needsReauth,
+  isSigningIn = false,
   autoDriveSyncEnabled,
   onToggleAutoDriveSync,
   driveSyncStatus,
@@ -468,6 +470,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                   <GoogleSignInButton
                     onClick={onGoogleLogin}
+                    disabled={isSigningIn}
+                    isLoading={isSigningIn}
                     label={needsReauth ? 'Đăng nhập lại Google' : 'Đăng nhập Google'}
                   />
                 </div>

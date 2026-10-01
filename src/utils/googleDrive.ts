@@ -13,7 +13,6 @@ import {
 } from 'firebase/auth';
 import { Capacitor } from '@capacitor/core';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
-import { GoogleAuth } from '@codetrix-studio/capacitor-google-auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 import {
   ExpenseItem,
@@ -108,6 +107,7 @@ export function getEffectiveAuthDomain(): string {
  */
 export interface StandaloneEnvironmentInfo {
   isStandalone: boolean;
+  isIframe: boolean;
   modeLabel: string;
   reasons: string[];
   details: {
@@ -116,13 +116,28 @@ export interface StandaloneEnvironmentInfo {
     isTWA: boolean;
     isCapacitor: boolean;
     isAndroidWebView: boolean;
+    isIframe: boolean;
   };
+}
+
+/**
+ * Requirement 3: Detect if the app is running inside an iframe (e.g. AI Studio preview `window.self !== window.top`)
+ */
+export function isRunningInIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    // Cross-origin access to window.top throws SecurityError when inside an iframe
+    return true;
+  }
 }
 
 export function detectStandaloneEnvironment(): StandaloneEnvironmentInfo {
   if (typeof window === 'undefined') {
     return {
       isStandalone: false,
+      isIframe: false,
       modeLabel: 'Web Browser',
       reasons: [],
       details: {
@@ -131,11 +146,13 @@ export function detectStandaloneEnvironment(): StandaloneEnvironmentInfo {
         isTWA: false,
         isCapacitor: false,
         isAndroidWebView: false,
+        isIframe: false,
       },
     };
   }
 
   const reasons: string[] = [];
+  const isIframe = isRunningInIframe();
 
   // 1. CSS display-mode: standalone / fullscreen / minimal-ui
   const displayModeStandalone = Boolean(
@@ -188,10 +205,13 @@ export function detectStandaloneEnvironment(): StandaloneEnvironmentInfo {
 
   const modeLabel = isStandalone
     ? `App đóng gói / Standalone (${reasons.join(', ')})`
+    : isIframe
+    ? 'Trình duyệt Web (Iframe Preview)'
     : 'Trình duyệt Web tiêu chuẩn';
 
   return {
     isStandalone,
+    isIframe,
     modeLabel,
     reasons,
     details: {
@@ -200,6 +220,7 @@ export function detectStandaloneEnvironment(): StandaloneEnvironmentInfo {
       isTWA,
       isCapacitor,
       isAndroidWebView,
+      isIframe,
     },
   };
 }
@@ -232,6 +253,7 @@ export function shouldUseRedirectFlow(): boolean {
   if (Capacitor.isNativePlatform()) return false;
   if (pref === 'redirect') return true;
   if (pref === 'popup') return false;
+  if (forceRedirectAfterPopupFailure) return true;
   return false;
 }
 
@@ -257,8 +279,16 @@ provider.setCustomParameters({
 
 // In-memory only access token cache (NEVER persisted to localStorage or sessionStorage)
 let isSigningIn = false;
+let isCheckingRedirectResult = false;
+let activeSignInPromise: Promise<{ user: GoogleDriveUser; accessToken: string } | null> | null = null;
+let consecutiveCancelledPopupCount = 0;
+let forceRedirectAfterPopupFailure = false;
 let cachedAccessToken: string | null = null;
 let cachedUserInfo: GoogleDriveUser | null = null;
+
+export function getIsSigningIn(): boolean {
+  return isSigningIn || Boolean(activeSignInPromise);
+}
 
 // Diagnostic log of the latest getRedirectResult / Auth operation for debugging on Android
 export interface AuthDiagnosticLog {
@@ -325,7 +355,7 @@ export function formatFirebaseAuthError(error: any, context: string): DriveSyncE
   const fbCode: string = error?.code || 'auth/unknown-error';
   const rawMsg: string = error?.message || 'Lỗi không xác định từ Firebase Authentication';
 
-  console.error(`[Firebase Auth Error in ${context}]`, {
+  console.warn(`[Firebase Auth Diagnostic in ${context}]`, {
     code: fbCode,
     message: rawMsg,
     email: error?.customData?.email || error?.email || null,
@@ -334,7 +364,6 @@ export function formatFirebaseAuthError(error: any, context: string): DriveSyncE
     origin: typeof window !== 'undefined' ? window.location.origin : '',
     href: typeof window !== 'undefined' ? window.location.href : '',
     standalone: detectStandaloneEnvironment(),
-    rawError: error,
   });
 
   let friendlyExplanation = '';
@@ -969,7 +998,7 @@ export const initAuth = (
       const urlError = urlParams.get('error') || urlParams.get('errorCode');
       const urlErrorDesc = urlParams.get('error_description') || urlParams.get('errorMessage');
       if (urlError) {
-        console.error('[Firebase Auth URL Error Param]:', { urlError, urlErrorDesc });
+        console.warn('[Firebase Auth URL Error Param]:', { urlError, urlErrorDesc });
         const errObj = new DriveSyncError(
           `Lỗi trả về từ trang đăng nhập [${urlError}]: ${urlErrorDesc || urlError}`,
           'FIREBASE_AUTH_ERROR',
@@ -983,7 +1012,8 @@ export const initAuth = (
   }
 
   // Requirement 1 & 3: Call getRedirectResult(auth) on app startup and log all returned parameters
-  isSigningIn = true;
+  // Note: Never call signInWithPopup on mount (Requirement 4)
+  isCheckingRedirectResult = true;
   getRedirectResult(auth)
     .then((result) => {
       const credential = result ? GoogleAuthProvider.credentialFromResult(result) : null;
@@ -1051,7 +1081,7 @@ export const initAuth = (
 
         if (tokenFromCredential) {
           cachedAccessToken = tokenFromCredential;
-          isSigningIn = false;
+          isCheckingRedirectResult = false;
           if (onAuthSuccess) {
             onAuthSuccess(mappedUser, tokenFromCredential, true);
           }
@@ -1062,7 +1092,7 @@ export const initAuth = (
             '[Firebase Auth] getRedirectResult returned user without OAuth accessToken:',
             diagnosticPayload
           );
-          isSigningIn = false;
+          isCheckingRedirectResult = false;
           if (onRedirectError) {
             onRedirectError(
               new DriveSyncError(
@@ -1074,12 +1104,18 @@ export const initAuth = (
           }
         }
       } else {
-        isSigningIn = false;
+        isCheckingRedirectResult = false;
       }
     })
     .catch((error: any) => {
-      isSigningIn = false;
+      isCheckingRedirectResult = false;
       setPendingRedirectMarker(false);
+
+      const fbCode: string = error?.code || '';
+      if (fbCode === 'auth/cancelled-popup-request' || fbCode === 'auth/popup-closed-by-user') {
+        console.debug('[Firebase Auth] Ignored harmless popup code in getRedirectResult:', fbCode);
+        return;
+      }
 
       const formattedErr = formatFirebaseAuthError(error, 'getRedirectResult');
       lastAuthDiagnosticLog = {
@@ -1114,14 +1150,14 @@ export const initAuth = (
 
       if (cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(mappedUser, cachedAccessToken, false);
-      } else if (!isSigningIn) {
+      } else if (!isSigningIn && !isCheckingRedirectResult) {
         cachedAccessToken = null;
         if (onAuthFailure) onAuthFailure(mappedUser);
       }
     } else {
       if (cachedUserInfo?.authMethod === 'gis' && cachedAccessToken) {
         if (onAuthSuccess) onAuthSuccess(cachedUserInfo, cachedAccessToken, false);
-      } else if (!isSigningIn) {
+      } else if (!isSigningIn && !isCheckingRedirectResult) {
         cachedAccessToken = null;
         cachedUserInfo = null;
         if (onAuthFailure) onAuthFailure(null);
@@ -1131,62 +1167,28 @@ export const initAuth = (
 };
 
 /**
- * Requirement 7: Sign in with Google on Capacitor Android APK using native Capacitor plugins
- * (`@capacitor-firebase/authentication` or `@codetrix-studio/capacitor-google-auth`)
- * instead of Firebase Web SDK popup/redirect which fails with "The requested action is invalid" in WebView.
+ * Requirement 2 & 3: Sign in with Google on Capacitor Android APK using
+ * `FirebaseAuthentication.signInWithGoogle()` from `@capacitor-firebase/authentication`
+ * (supports Capacitor 8 natively without @codetrix-studio/capacitor-google-auth).
  */
 export async function signInWithCapacitorNativeGoogle(): Promise<{
   user: GoogleDriveUser;
   accessToken: string;
 }> {
-  let idToken: string | null = null;
-  let accessToken: string | null = null;
-  let profileName: string | null = null;
-  let profileEmail: string | null = null;
-  let profilePhoto: string | null = null;
+  const fbNativeRes = await FirebaseAuthentication.signInWithGoogle({
+    scopes: ['email', 'profile', ...SCOPES],
+    useCredentialManager: false,
+  });
 
-  // 1. Try @capacitor-firebase/authentication first
-  try {
-    const fbNativeRes = await FirebaseAuthentication.signInWithGoogle({
-      scopes: ['email', 'profile', ...SCOPES],
-      useCredentialManager: false,
-    });
-    idToken = fbNativeRes?.credential?.idToken || null;
-    accessToken = fbNativeRes?.credential?.accessToken || null;
-    profileName = fbNativeRes?.user?.displayName || null;
-    profileEmail = fbNativeRes?.user?.email || null;
-    profilePhoto = fbNativeRes?.user?.photoUrl || null;
-  } catch (capFbErr: any) {
-    console.warn(
-      '[Capacitor Auth] @capacitor-firebase/authentication fallback to @codetrix-studio/capacitor-google-auth:',
-      capFbErr
-    );
-  }
-
-  // 2. Fallback to @codetrix-studio/capacitor-google-auth if idToken/accessToken not yet obtained
-  if (!idToken && !accessToken) {
-    try {
-      const clientId = getEffectiveGoogleClientId();
-      await GoogleAuth.initialize({
-        clientId: clientId || undefined,
-        scopes: ['profile', 'email', ...SCOPES],
-        grantOfflineAccess: false,
-      });
-    } catch {
-      // ignore if already initialized
-    }
-
-    const googleUser = await GoogleAuth.signIn();
-    idToken = googleUser?.authentication?.idToken || null;
-    accessToken = googleUser?.authentication?.accessToken || null;
-    profileName = googleUser?.name || googleUser?.givenName || null;
-    profileEmail = googleUser?.email || null;
-    profilePhoto = googleUser?.imageUrl || null;
-  }
+  const idToken = fbNativeRes?.credential?.idToken || null;
+  const accessToken = fbNativeRes?.credential?.accessToken || null;
+  const profileName = fbNativeRes?.user?.displayName || null;
+  const profileEmail = fbNativeRes?.user?.email || null;
+  const profilePhoto = fbNativeRes?.user?.photoUrl || null;
 
   if (!idToken && !accessToken) {
     throw new DriveSyncError(
-      'Không lấy được thông tin xác thực từ plugin đăng nhập Google gốc trên thiết bị.',
+      'Không lấy được thông tin xác thực từ FirebaseAuthentication.signInWithGoogle trên thiết bị.',
       'FIREBASE_AUTH_ERROR'
     );
   }
@@ -1217,9 +1219,9 @@ export async function signInWithCapacitorNativeGoogle(): Promise<{
 
 /**
  * Sign in with Google:
- * 1. If running in Capacitor Native APK -> uses native Capacitor plugin (`@capacitor-firebase/authentication` or `@codetrix-studio/capacitor-google-auth`) + `signInWithCredential`.
+ * 1. If running in Capacitor Native APK (`Capacitor.isNativePlatform()`) -> calls `FirebaseAuthentication.signInWithGoogle()` from `@capacitor-firebase/authentication` + `signInWithCredential`.
  * 2. If user pasted a custom Google Client ID in Settings -> uses GIS TokenClient + `signInWithCredential`.
- * 3. Otherwise on Web -> uses `signInWithPopup(auth, provider)`.
+ * 3. Otherwise on Web -> uses `signInWithPopup(auth, provider)` with fallback to `signInWithRedirect(auth, provider)`.
  */
 export const googleSignIn = async (
   onBeforeRedirect?: () => void
@@ -1227,157 +1229,176 @@ export const googleSignIn = async (
   user: GoogleDriveUser;
   accessToken: string;
 } | null> => {
-  if (typeof navigator !== 'undefined' && !navigator.onLine) {
-    throw new DriveSyncError(
-      'Thiết bị đang ngoại tuyến. Vui lòng kết nối Internet để đăng nhập Google.',
-      'OFFLINE'
+  // Requirement 1: Prevent duplicate signInWithPopup calls while a sign-in request is still pending
+  if (isSigningIn || activeSignInPromise) {
+    console.debug(
+      '[Firebase Auth] Sign-in request is already in progress (isSigningIn=true). Ignoring duplicate call.'
     );
+    return activeSignInPromise;
   }
 
-  const envInfo = detectStandaloneEnvironment();
-
-  // Requirement 7: Use native Capacitor Google Sign-In plugin in packaged APK
-  if (Capacitor.isNativePlatform() || envInfo.details.isCapacitor) {
+  isSigningIn = true;
+  activeSignInPromise = (async () => {
     try {
-      isSigningIn = true;
-      return await signInWithCapacitorNativeGoogle();
-    } catch (capErr: any) {
-      console.warn('[Capacitor Auth] Native plugin error, checking fallback:', capErr);
-      // If user explicitly canceled, surface clean message
-      const msg = String(capErr?.message || capErr || '');
-      if (msg.toLowerCase().includes('cancel') || msg.includes('12501')) {
-        isSigningIn = false;
-        throw new DriveSyncError('Đã hủy đăng nhập Google.', 'UNKNOWN');
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        throw new DriveSyncError(
+          'Thiết bị đang ngoại tuyến. Vui lòng kết nối Internet để đăng nhập Google.',
+          'OFFLINE'
+        );
       }
-      // If a custom Google Client ID is available, fallback to GIS instead of broken firebaseapp.com redirect
-      const clientId = getEffectiveGoogleClientId();
-      if (clientId) {
-        return await signInWithGIS(clientId);
+
+      const envInfo = detectStandaloneEnvironment();
+      const inIframe = isRunningInIframe();
+
+      // Requirement 2 & 3: When running in Capacitor native app (`Capacitor.isNativePlatform()`),
+      // call `FirebaseAuthentication.signInWithGoogle()` from `@capacitor-firebase/authentication`
+      if (Capacitor.isNativePlatform()) {
+        try {
+          return await signInWithCapacitorNativeGoogle();
+        } catch (capErr: any) {
+          console.warn('[Capacitor Auth] FirebaseAuthentication.signInWithGoogle error:', capErr);
+          const msg = String(capErr?.message || capErr || '');
+          if (msg.toLowerCase().includes('cancel') || msg.includes('12501')) {
+            return null;
+          }
+          const clientId = getEffectiveGoogleClientId();
+          if (clientId) {
+            return await signInWithGIS(clientId);
+          }
+          throw new DriveSyncError(
+            capErr?.message ||
+              'Lỗi đăng nhập Google trong APK. Hãy kiểm tra SHA-1 / google-services.json hoặc nhập Google Client ID trong Cài đặt.',
+            'FIREBASE_AUTH_ERROR'
+          );
+        }
       }
-      isSigningIn = false;
-      throw new DriveSyncError(
-        capErr?.message ||
-          'Lỗi đăng nhập Google trong APK. Hãy kiểm tra SHA-1 / google-services.json hoặc nhập Google Client ID trong Cài đặt.',
-        'FIREBASE_AUTH_ERROR'
-      );
+
+      const customClientId = getUserGoogleClientId();
+      if (customClientId) {
+        return await signInWithGIS(customClientId);
+      }
+
+      const triggerRedirectSignIn = async (reasonContext: string): Promise<null> => {
+        console.info(`[Firebase Auth] Switching to signInWithRedirect (${reasonContext})...`);
+        if (onBeforeRedirect) {
+          onBeforeRedirect();
+        }
+        setPendingRedirectMarker(true);
+        try {
+          await signInWithRedirect(auth, provider);
+          return null; // Browser will navigate away
+        } catch (redirectInitErr: any) {
+          setPendingRedirectMarker(false);
+          throw formatFirebaseAuthError(redirectInitErr, `signInWithRedirect (${reasonContext})`);
+        }
+      };
+
+      const useRedirect = shouldUseRedirectFlow();
+      if (useRedirect) {
+        return await triggerRedirectSignIn('preferred_or_fallback_redirect');
+      }
+
+      // Requirement 2 & 3: Wrap signInWithPopup in try/catch, silently ignore auth/cancelled-popup-request,
+      // and fallback to signInWithRedirect if in iframe / popup-blocked / repeatedly cancelled.
+      try {
+        const result = await signInWithPopup(auth, provider);
+        consecutiveCancelledPopupCount = 0;
+        forceRedirectAfterPopupFailure = false;
+
+        const credential = GoogleAuthProvider.credentialFromResult(result);
+        const token =
+          credential?.accessToken || (result as any)?._tokenResponse?.oauthAccessToken || '';
+
+        if (token) {
+          cachedAccessToken = token;
+        }
+        const mappedUser: GoogleDriveUser = {
+          uid: result.user.uid,
+          displayName: result.user.displayName,
+          email: result.user.email,
+          photoURL: result.user.photoURL,
+          authMethod: 'firebase',
+        };
+        cachedUserInfo = mappedUser;
+
+        lastAuthDiagnosticLog = {
+          timestamp: new Date().toLocaleTimeString('vi-VN'),
+          flowUsed: 'popup',
+          authDomain: getEffectiveAuthDomain(),
+          currentOrigin: window.location.origin,
+          environment: envInfo.modeLabel,
+          redirectResultParams: {
+            uid: mappedUser.uid,
+            email: mappedUser.email,
+            hasAccessToken: Boolean(token),
+          },
+          errorCode: null,
+          errorMessage: null,
+        };
+
+        return { user: mappedUser, accessToken: token };
+      } catch (error: any) {
+        const fbCode: string = error?.code || '';
+
+        // Requirement 2 & 3: Handle auth/cancelled-popup-request silently (debug log only, no red error toast).
+        // If it happens repeatedly (>= 2 times) or inside an iframe after repeated cancel, fallback to signInWithRedirect.
+        if (fbCode === 'auth/cancelled-popup-request') {
+          consecutiveCancelledPopupCount += 1;
+          console.debug(
+            `[Firebase Auth] Silently ignored auth/cancelled-popup-request (count=${consecutiveCancelledPopupCount}, inIframe=${inIframe}):`,
+            error
+          );
+
+          if (consecutiveCancelledPopupCount >= 2) {
+            consecutiveCancelledPopupCount = 0;
+            forceRedirectAfterPopupFailure = true;
+            return await triggerRedirectSignIn('repeated_cancelled_popup_fallback');
+          }
+          return null;
+        }
+
+        if (fbCode === 'auth/popup-closed-by-user') {
+          console.debug('[Firebase Auth] Popup closed by user (auth/popup-closed-by-user).');
+          return null;
+        }
+
+        console.warn('[Firebase Auth] signInWithPopup warning:', error);
+
+        // Requirement 3: Fallback to signInWithRedirect if running in iframe (window.self !== window.top)
+        // OR if popup is blocked / unsupported in environment
+        if (
+          inIframe ||
+          fbCode === 'auth/popup-blocked' ||
+          fbCode === 'auth/operation-not-supported-in-this-environment' ||
+          fbCode === 'auth/invalid-action-code' ||
+          fbCode === 'auth/web-storage-unsupported'
+        ) {
+          forceRedirectAfterPopupFailure = true;
+          return await triggerRedirectSignIn(
+            inIframe ? `iframe_fallback (${fbCode || 'iframe'})` : `popup_blocked (${fbCode})`
+          );
+        }
+
+        const formatted = formatFirebaseAuthError(error, 'signInWithPopup');
+        lastAuthDiagnosticLog = {
+          timestamp: new Date().toLocaleTimeString('vi-VN'),
+          flowUsed: 'popup',
+          authDomain: getEffectiveAuthDomain(),
+          currentOrigin: window.location.origin,
+          environment: envInfo.modeLabel,
+          redirectResultParams: null,
+          errorCode: fbCode || 'auth/unknown',
+          errorMessage: formatted.message,
+        };
+        throw formatted;
+      }
     } finally {
       isSigningIn = false;
+      activeSignInPromise = null;
     }
-  }
+  })();
 
-  const customClientId = getUserGoogleClientId();
-  if (customClientId) {
-    return await signInWithGIS(customClientId);
-  }
-  const useRedirect = shouldUseRedirectFlow();
-
-  if (useRedirect) {
-    console.log('[Firebase Auth] Using signInWithRedirect for standalone/packaged environment:', {
-      authDomain: getEffectiveAuthDomain(),
-      origin: window.location.origin,
-      envInfo,
-    });
-    if (onBeforeRedirect) {
-      onBeforeRedirect();
-    }
-    setPendingRedirectMarker(true);
-    try {
-      isSigningIn = true;
-      await signInWithRedirect(auth, provider);
-      return null; // Browser will redirect
-    } catch (redirectInitErr: any) {
-      isSigningIn = false;
-      setPendingRedirectMarker(false);
-      throw formatFirebaseAuthError(redirectInitErr, 'signInWithRedirect');
-    }
-  }
-
-  // Standard Web Browser: Try signInWithPopup first, fallback to signInWithRedirect if needed
-  try {
-    isSigningIn = true;
-    console.log('[Firebase Auth] Attempting signInWithPopup on web browser...', {
-      authDomain: getEffectiveAuthDomain(),
-      origin: window.location.origin,
-    });
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    const token =
-      credential?.accessToken || (result as any)?._tokenResponse?.oauthAccessToken || null;
-
-    if (!token) {
-      throw new DriveSyncError(
-        'Không lấy được Access Token từ phiên đăng nhập Google.',
-        'TOKEN_EXPIRED'
-      );
-    }
-
-    cachedAccessToken = token;
-    const mappedUser: GoogleDriveUser = {
-      uid: result.user.uid,
-      displayName: result.user.displayName,
-      email: result.user.email,
-      photoURL: result.user.photoURL,
-      authMethod: 'firebase',
-    };
-    cachedUserInfo = mappedUser;
-
-    lastAuthDiagnosticLog = {
-      timestamp: new Date().toLocaleTimeString('vi-VN'),
-      flowUsed: 'popup',
-      authDomain: getEffectiveAuthDomain(),
-      currentOrigin: window.location.origin,
-      environment: envInfo.modeLabel,
-      redirectResultParams: {
-        uid: mappedUser.uid,
-        email: mappedUser.email,
-        hasAccessToken: true,
-      },
-      errorCode: null,
-      errorMessage: null,
-    };
-
-    return { user: mappedUser, accessToken: token };
-  } catch (error: any) {
-    console.error('[Firebase Auth] signInWithPopup error:', error);
-
-    const fbCode: string = error?.code || '';
-    // Automatically fallback to signInWithRedirect if popup is blocked or unsupported in environment
-    if (
-      fbCode === 'auth/operation-not-supported-in-this-environment' ||
-      fbCode === 'auth/popup-blocked' ||
-      fbCode === 'auth/invalid-action-code'
-    ) {
-      console.log(
-        `[Firebase Auth] Popup failed with ${fbCode}, falling back to signInWithRedirect...`
-      );
-      if (onBeforeRedirect) {
-        onBeforeRedirect();
-      }
-      setPendingRedirectMarker(true);
-      try {
-        await signInWithRedirect(auth, provider);
-        return null;
-      } catch (redirErr: any) {
-        setPendingRedirectMarker(false);
-        throw formatFirebaseAuthError(redirErr, 'signInWithRedirect (fallback)');
-      }
-    }
-
-    const formatted = formatFirebaseAuthError(error, 'signInWithPopup');
-    lastAuthDiagnosticLog = {
-      timestamp: new Date().toLocaleTimeString('vi-VN'),
-      flowUsed: 'popup',
-      authDomain: getEffectiveAuthDomain(),
-      currentOrigin: window.location.origin,
-      environment: envInfo.modeLabel,
-      redirectResultParams: null,
-      errorCode: fbCode || 'auth/unknown',
-      errorMessage: formatted.message,
-    };
-    throw formatted;
-  } finally {
-    isSigningIn = false;
-  }
+  return activeSignInPromise;
 };
 
 export const getAccessToken = async (): Promise<string | null> => {
@@ -1400,7 +1421,6 @@ export const logoutGoogleDrive = async (): Promise<void> => {
     await auth.signOut();
     if (Capacitor.isNativePlatform()) {
       await FirebaseAuthentication.signOut().catch(() => {});
-      await GoogleAuth.signOut().catch(() => {});
     }
     if (tokenToRevoke && (window as any).google?.accounts?.oauth2?.revoke) {
       (window as any).google.accounts.oauth2.revoke(tokenToRevoke, () => {});

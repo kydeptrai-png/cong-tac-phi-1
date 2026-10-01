@@ -30,6 +30,7 @@ interface AutoBackupBarProps {
   driveUser: GoogleDriveUser | null;
   hasActiveToken: boolean;
   needsReauth: boolean;
+  isSigningIn?: boolean;
   autoDriveSyncEnabled: boolean;
   onToggleAutoDriveSync: (enabled: boolean) => void;
   driveSyncStatus: 'idle' | 'syncing' | 'synced' | 'error';
@@ -51,6 +52,7 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
   driveUser,
   hasActiveToken,
   needsReauth,
+  isSigningIn = false,
   driveSyncStatus,
   driveError,
   onGoogleLogin,
@@ -82,13 +84,20 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
           {!isSignedIn ? (
             <button
               type="button"
+              disabled={isSigningIn}
               onClick={onGoogleLogin}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-sky-600 hover:bg-sky-700 text-white shadow-2xs transition-colors cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-sky-600 hover:bg-sky-700 disabled:bg-sky-400 disabled:cursor-not-allowed text-white shadow-2xs transition-colors cursor-pointer"
               title="Đăng nhập Google để bật đồng bộ thời gian thực (Firestore) giữa điện thoại và máy tính"
             >
-              <Cloud size={13} />
+              {isSigningIn ? (
+                <RefreshCw size={13} className="animate-spin" />
+              ) : (
+                <Cloud size={13} />
+              )}
               <span>
-                {needsReauth
+                {isSigningIn
+                  ? 'Đang đăng nhập...'
+                  : needsReauth
                   ? 'Đăng nhập lại Google'
                   : 'Đăng nhập Google (Đồng bộ Real-time)'}
               </span>
@@ -216,10 +225,12 @@ export const AutoBackupBar: React.FC<AutoBackupBarProps> = ({
           {driveError.code === 'TOKEN_EXPIRED' && (
             <button
               type="button"
+              disabled={isSigningIn}
               onClick={onGoogleLogin}
-              className="px-2.5 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white text-[11px] font-bold transition-colors cursor-pointer"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 disabled:opacity-60 disabled:cursor-not-allowed text-white text-[11px] font-bold transition-colors cursor-pointer"
             >
-              Đăng nhập lại ngay
+              {isSigningIn && <RefreshCw size={12} className="animate-spin" />}
+              <span>{isSigningIn ? 'Đang đăng nhập...' : 'Đăng nhập lại ngay'}</span>
             </button>
           )}
         </div>

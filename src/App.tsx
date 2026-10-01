@@ -9,6 +9,7 @@ import {
   MessageSquareText,
   ClipboardPaste,
   Settings,
+  RefreshCw,
 } from 'lucide-react';
 import {
   ExpenseItem,
@@ -76,6 +77,7 @@ import {
   DRIVE_BACKUP_FILENAME,
   initAuth,
   googleSignIn,
+  getIsSigningIn,
   logoutGoogleDrive,
   findDriveBackupFile,
   uploadBackupToDrive,
@@ -397,6 +399,8 @@ export default function App() {
   const [driveUser, setDriveUser] = useState<GoogleDriveUser | null>(null);
   const [hasActiveToken, setHasActiveToken] = useState<boolean>(false);
   const [needsReauth, setNeedsReauth] = useState<boolean>(false);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const isSigningInRef = useRef<boolean>(false);
   const [autoDriveSyncEnabled, setAutoDriveSyncEnabledState] = useState<boolean>(() =>
     getAutoDriveSyncEnabled()
   );
@@ -900,12 +904,20 @@ export default function App() {
     defaultMonthForNew,
   ]);
 
-  // Requirement 1 & 3: Sign in with Google & check Drive backup timestamp
+  // Requirement 1, 2, 3, 4: Sign in with Google (user-initiated only, guarded by isSigningIn ref + state)
   const handleGoogleLogin = async () => {
+    if (isSigningInRef.current || isSigningIn || getIsSigningIn()) {
+      console.debug('[Firebase Auth] Sign-in already in progress, ignoring duplicate click.');
+      return;
+    }
+
+    isSigningInRef.current = true;
+    setIsSigningIn(true);
     setDriveError(null);
+
     try {
       const result = await googleSignIn(saveCurrentContextBeforeRedirect);
-      // If signInWithRedirect was triggered, result is null because browser is navigating
+      // If signInWithRedirect was triggered or popup was harmlessly cancelled, result is null
       if (!result) return;
 
       setDriveUser(result.user);
@@ -919,6 +931,19 @@ export default function App() {
         await handlePostAuthDriveSync(result.accessToken, pendingRetryAfterReauthRef.current);
       }
     } catch (err: any) {
+      const fbCode = err?.firebaseErrorCode || err?.code || '';
+      const rawMsg = String(err?.message || '');
+
+      // Requirement 2: Silently ignore auth/cancelled-popup-request (only debug log, no red error toast/banner)
+      if (
+        fbCode === 'auth/cancelled-popup-request' ||
+        fbCode === 'auth/popup-closed-by-user' ||
+        rawMsg.includes('auth/cancelled-popup-request')
+      ) {
+        console.debug('[Firebase Auth] Silently ignored cancelled popup request in UI:', err);
+        return;
+      }
+
       setDriveSyncStatus('error');
       const syncErr: DriveSyncError =
         err instanceof DriveSyncError
@@ -929,6 +954,9 @@ export default function App() {
         code: syncErr.code,
         firebaseErrorCode: syncErr.firebaseErrorCode,
       });
+    } finally {
+      isSigningInRef.current = false;
+      setIsSigningIn(false);
     }
   };
 
@@ -1920,12 +1948,22 @@ export default function App() {
         ) : (
           <button
             type="button"
+            disabled={isSigningIn}
             onClick={handleGoogleLogin}
             title="Bấm để đăng nhập Google và bật đồng bộ thời gian thực giữa điện thoại & máy tính"
-            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-slate-200 hover:border-teal-300 shadow-md text-[11px] font-semibold text-slate-700 hover:text-teal-900 transition-colors cursor-pointer"
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/95 backdrop-blur-md border border-slate-200 hover:border-teal-300 disabled:opacity-70 disabled:cursor-not-allowed shadow-md text-[11px] font-semibold text-slate-700 hover:text-teal-900 transition-colors cursor-pointer"
           >
-            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0" />
-            <span>Đã đồng bộ (Lưu nội bộ • Bấm để đồng bộ Cloud)</span>
+            {isSigningIn ? (
+              <>
+                <RefreshCw size={11} className="animate-spin text-teal-600 shrink-0" />
+                <span>Đang đăng nhập Google...</span>
+              </>
+            ) : (
+              <>
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0" />
+                <span>Đã đồng bộ (Lưu nội bộ • Bấm để đồng bộ Cloud)</span>
+              </>
+            )}
           </button>
         )}
       </div>
@@ -1992,6 +2030,7 @@ export default function App() {
           driveUser={driveUser}
           hasActiveToken={hasActiveToken}
           needsReauth={needsReauth}
+          isSigningIn={isSigningIn}
           autoDriveSyncEnabled={autoDriveSyncEnabled}
           onToggleAutoDriveSync={handleToggleAutoDriveSync}
           driveSyncStatus={driveSyncStatus}
@@ -2290,6 +2329,7 @@ export default function App() {
         driveUser={driveUser}
         hasActiveToken={hasActiveToken}
         needsReauth={needsReauth}
+        isSigningIn={isSigningIn}
         autoDriveSyncEnabled={autoDriveSyncEnabled}
         onToggleAutoDriveSync={handleToggleAutoDriveSync}
         driveSyncStatus={driveSyncStatus}
